@@ -59,7 +59,13 @@ No advertising or telemetry; the program connects only to your VPN servers.
   freshly generated key pair; export and delete.
 - **Live statistics**: latest handshake, received and sent traffic, endpoint, listen port and
   the AmneziaWG obfuscation parameters (Jc, Jmin, Jmax, S1–S4, H1–H4, I1–I5).
-- **AmneziaWG 1.x and 2.0** configs as well as plain WireGuard.
+- **AmneziaWG 1.0, 1.5 and 2.0** configs as well as plain WireGuard; the version is detected
+  and the obfuscation parameters are shown one readable row per group.
+- **Bypass VPN for local networks** (☰ menu): with a full-tunnel config, private addresses
+  (192.168.x.x, 10.x.x.x, 172.16–31.x.x, link-local, IPv6 ULA) go directly, so printers, NAS
+  and the router stay reachable; addresses inside the tunnel (its subnet, private DNS) still go
+  through the VPN. Implemented with `ip rule`s added to the runtime copy of the config; the
+  saved config is not changed.
 - Light, dark and system themes; English and Russian interface; operation log.
 
 <p align="center">
@@ -105,7 +111,7 @@ precedence over the built-in copies.
 |---|---|
 | Program | `/usr/bin/awg-gui` |
 | Tunnel configs | `~/.config/awg-gui/tunnels/<name>.conf` (mode 0600) |
-| Settings (language, theme) | `~/.config/awg-gui/settings.json` |
+| Settings (language, theme, local network bypass) | `~/.config/awg-gui/settings.json` |
 | Copy of the config of an active tunnel | `/run/awg-gui/<name>.conf` (root, needed for `awg-quick down`) |
 | Built-in `amneziawg-go`, `awg`, `awg-quick` | unpacked to `/var/lib/awg-gui/bin/` when first needed |
 | Autostart entry | `~/.config/autostart/awg-gui.desktop` |

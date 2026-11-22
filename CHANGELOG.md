@@ -22,6 +22,10 @@ First prerelease.
   policy with a clear message and remembered authorization.
 - System tray icon (StatusNotifierItem) with tunnel toggles; closing the window hides the
   program to the tray; autostart at login into the tray; single instance.
+- AmneziaWG 1.0 / 1.5 / 2.0 detection; the obfuscation parameters (junk packets, padding,
+  header ranges, protocol imitation I1–I5) are shown in a collapsible block, one row each.
+- **Bypass VPN for local networks** option: private addresses go directly while the tunnel's
+  own subnet and private DNS servers stay in the VPN (`ip rule`s in the runtime config).
 - Light, dark and system themes; English and Russian interface; operation log.
 - Debian package `awg-gui_<version>_amd64.deb` with menu entry, icons and polkit policy;
   release workflow on GitHub Actions.

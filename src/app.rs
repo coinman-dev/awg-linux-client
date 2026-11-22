@@ -1,5 +1,5 @@
 use crate::client::{Event, Helper};
-use crate::config::{self, AWG_KEYS};
+use crate::config;
 use crate::i18n::{EN, RU, Tr};
 use crate::import;
 use crate::proto::{IfaceStatus, Request};
@@ -31,6 +31,8 @@ struct Settings {
     lang: Option<String>,
     #[serde(default)]
     theme: Option<String>,
+    #[serde(default)]
+    lan_bypass: bool,
 }
 
 fn theme_from(s: Option<&str>) -> egui::ThemePreference {
@@ -112,6 +114,8 @@ pub struct App {
     pub show_requested: bool,
     autostart: bool,
     debug: String,
+    lan_bypass: bool,
+    awg_expanded: bool,
 }
 
 impl App {
@@ -153,6 +157,8 @@ impl App {
             quit: false,
             show_requested: false,
             autostart: crate::desktop::autostart_enabled(),
+            lan_bypass: settings.lan_bypass,
+            awg_expanded: false,
             debug: if cfg!(debug_assertions) { std::env::var("AWG_GUI_DEBUG").unwrap_or_default() } else { String::new() },
         };
         app.selected = app.tunnels.first().map(|t| t.name.clone());
@@ -176,6 +182,12 @@ impl App {
         }
         if dbg.contains("log") {
             app.tab = Tab::Log;
+        }
+        if dbg.contains("awg") {
+            app.awg_expanded = true;
+        }
+        if dbg.contains("lan") {
+            app.lan_bypass = true;
         }
         app
     }
@@ -443,6 +455,30 @@ impl App {
         }
     }
 
+    /// The config actually given to awg-quick (the saved one is never changed).
+    fn runtime_config(&self, text: &str) -> String {
+        if self.lan_bypass { config::with_lan_bypass(text) } else { text.to_string() }
+    }
+
+    fn set_lan_bypass(&mut self, on: bool) {
+        self.lan_bypass = on;
+        self.save_settings();
+        // Re-apply to an active full-tunnel connection.
+        let active: Vec<Tunnel> = self
+            .tunnels
+            .iter()
+            .filter(|t| self.active.contains(&t.name))
+            .filter(|t| config::parse(&t.text).map(|c| c.is_full_tunnel()).unwrap_or(false))
+            .cloned()
+            .collect();
+        for t in active {
+            self.info(self.tr().reconnecting.replace("{}", &t.name));
+            self.send(Request::Down { name: t.name.clone(), config: Some(t.text.clone()) });
+            let cfg = self.runtime_config(&t.text);
+            self.send(Request::Up { name: t.name, config: cfg });
+        }
+    }
+
     fn activate(&mut self, name: &str) {
         let Some(t) = self.tunnel(name).cloned() else { return };
         if let Err(e) = config::validate(&t.text) {
@@ -454,7 +490,8 @@ impl App {
         for o in others {
             self.send(Request::Down { name: o.name, config: Some(o.text) });
         }
-        self.send(Request::Up { name: t.name, config: t.text });
+        let cfg = self.runtime_config(&t.text);
+        self.send(Request::Up { name: t.name, config: cfg });
     }
 
     fn deactivate(&mut self, name: &str) {
@@ -589,7 +626,8 @@ impl App {
         if was_active && old_text.as_deref() != Some(text.as_str()) {
             self.info(tr.reconnecting.replace("{}", &name));
             self.send(Request::Down { name: name.clone(), config: old_text });
-            self.send(Request::Up { name, config: text });
+            let cfg = self.runtime_config(&text);
+            self.send(Request::Up { name, config: cfg });
         } else {
             self.info(tr.saved);
         }
@@ -599,6 +637,7 @@ impl App {
         let st = Settings {
             lang: Some(if self.ru { "ru" } else { "en" }.into()),
             theme: Some(theme_str(self.theme).into()),
+            lan_bypass: self.lan_bypass,
         };
         let _ = std::fs::write(
             self.store.dir.parent().unwrap().join("settings.json"),
@@ -694,6 +733,10 @@ impl eframe::App for App {
                         let mut auto = self.autostart;
                         if ui.checkbox(&mut auto, tr.autostart).changed() {
                             self.set_autostart(auto);
+                        }
+                        let mut lan = self.lan_bypass;
+                        if ui.checkbox(&mut lan, tr.lan_bypass).on_hover_text(tr.lan_bypass_hint).changed() {
+                            self.set_lan_bypass(lan);
                         }
                         ui.separator();
                         ui.label(RichText::new(tr.theme).weak());
@@ -942,22 +985,33 @@ impl App {
                     ui.label(m);
                     ui.end_row();
                 }
+                if conf.is_full_tunnel() {
+                    row_label(ui, tr.local_network);
+                    let txt = if self.lan_bypass { tr.lan_direct } else { tr.lan_via_vpn };
+                    ui.label(txt).on_hover_text(tr.lan_bypass_hint);
+                    ui.end_row();
+                }
                 row_label(ui, tr.awg_params);
-                if conf.is_awg() {
-                    let s: Vec<String> = AWG_KEYS
-                        .iter()
-                        .filter_map(|k| iface.get(k).map(|v| (k, v)))
-                        .map(|(k, v)| {
-                            let v = if v.len() > 24 { format!("{}…", &v[..v.floor_char_boundary(24)]) } else { v.to_string() };
-                            format!("{k}={v}")
-                        })
-                        .collect();
-                    ui.add(egui::Label::new(RichText::new(s.join("  ")).monospace()).wrap());
-                } else {
-                    ui.label(RichText::new(tr.plain_wg).weak());
+                match conf.awg_version() {
+                    Some(v) => {
+                        ui.horizontal(|ui| {
+                            ui.label(v);
+                            let t = if self.awg_expanded { tr.hide_details } else { tr.show_details };
+                            if ui.small_button(t).clicked() {
+                                self.awg_expanded = !self.awg_expanded;
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(RichText::new(tr.plain_wg).weak());
+                    }
                 }
                 ui.end_row();
             });
+            if self.awg_expanded && conf.is_awg() {
+                ui.add_space(4.0);
+                awg_details(ui, &iface, tr);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let (label, up) = if active || busy == Some(Busy::Up) {
@@ -1240,7 +1294,69 @@ fn grid(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, body: imp
     egui::Grid::new(id).num_columns(2).spacing([16.0, 6.0]).min_col_width(120.0).show(ui, body);
 }
 
+/// AmneziaWG obfuscation parameters, one readable row per group.
+fn awg_details(ui: &mut egui::Ui, iface: &config::Section, tr: &Tr) {
+    let get = |k: &str| iface.get(k).map(str::to_string);
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(6.0)
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            grid(ui, "awg-details", |ui| {
+                if let Some(jc) = get("Jc") {
+                    row_label(ui, tr.awg_junk);
+                    let size = match (get("Jmin"), get("Jmax")) {
+                        (Some(a), Some(b)) => tr.awg_junk_fmt.replacen("{}", &jc, 1).replacen("{}", &format!("{a}–{b}"), 1),
+                        _ => jc,
+                    };
+                    ui.label(size);
+                    ui.end_row();
+                }
+                let s: Vec<String> = ["S1", "S2", "S3", "S4"]
+                    .iter()
+                    .filter_map(|k| get(k).map(|v| format!("{k} = {v}")))
+                    .collect();
+                if !s.is_empty() {
+                    row_label(ui, tr.awg_padding);
+                    ui.label(RichText::new(s.join("    ")).monospace());
+                    ui.end_row();
+                }
+                for (i, k) in ["H1", "H2", "H3", "H4"].iter().enumerate() {
+                    if let Some(v) = get(k) {
+                        row_label(ui, if i == 0 { tr.awg_headers } else { "" });
+                        ui.label(RichText::new(format!("{k} = {}", v.replace('-', " – "))).monospace());
+                        ui.end_row();
+                    }
+                }
+                let mut first = true;
+                for k in ["I1", "I2", "I3", "I4", "I5"] {
+                    if let Some(v) = get(k) {
+                        row_label(ui, if first { tr.awg_imitation } else { "" });
+                        first = false;
+                        let short = if v.chars().count() > 44 {
+                            format!("{}…", v.chars().take(44).collect::<String>())
+                        } else {
+                            v.clone()
+                        };
+                        let r = ui
+                            .add(egui::Label::new(RichText::new(format!("{k} = {short}")).monospace()).sense(Sense::click()))
+                            .on_hover_text(format!("{v}\n\n{}", tr.click_to_copy));
+                        if r.clicked() {
+                            ui.ctx().copy_text(v.clone());
+                        }
+                        ui.end_row();
+                    }
+                }
+            });
+        });
+}
+
 fn row_label(ui: &mut egui::Ui, s: &str) {
+    if s.is_empty() {
+        ui.label("");
+        return;
+    }
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.label(RichText::new(format!("{s}:")).weak());
     });

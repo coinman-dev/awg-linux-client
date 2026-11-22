@@ -83,6 +83,18 @@ pub struct Tr {
     pub language: &'static str,
     pub autostart: &'static str,
     pub quit: &'static str,
+    pub lan_bypass: &'static str,
+    pub lan_bypass_hint: &'static str,
+    pub local_network: &'static str,
+    pub lan_direct: &'static str,
+    pub lan_via_vpn: &'static str,
+    pub show_details: &'static str,
+    pub hide_details: &'static str,
+    pub awg_junk: &'static str,
+    pub awg_junk_fmt: &'static str,
+    pub awg_padding: &'static str,
+    pub awg_headers: &'static str,
+    pub awg_imitation: &'static str,
 }
 
 pub const RU: Tr = Tr {
@@ -168,6 +180,18 @@ pub const RU: Tr = Tr {
     language: "Язык",
     autostart: "Запускать при входе в систему",
     quit: "Выход",
+    lan_bypass: "Локальная сеть в обход VPN",
+    lan_bypass_hint: "Адреса локальных сетей (192.168.x.x, 10.x.x.x, 172.16–31.x.x, link-local, IPv6 ULA) идут напрямую, а не через VPN: принтеры, NAS, роутер остаются доступны. Адреса внутри самого туннеля по-прежнему идут через VPN. Применяется к туннелям, которые направляют весь трафик через VPN.",
+    local_network: "Локальная сеть",
+    lan_direct: "напрямую, в обход VPN",
+    lan_via_vpn: "через VPN",
+    show_details: "подробнее",
+    hide_details: "скрыть",
+    awg_junk: "Мусорные пакеты",
+    awg_junk_fmt: "{} шт., {} байт (Jc, Jmin–Jmax)",
+    awg_padding: "Отступы, байт",
+    awg_headers: "Заголовки",
+    awg_imitation: "Имитация протоколов",
 };
 
 pub const EN: Tr = Tr {
@@ -253,6 +277,18 @@ pub const EN: Tr = Tr {
     language: "Language",
     autostart: "Start on login",
     quit: "Quit",
+    lan_bypass: "Bypass VPN for local networks",
+    lan_bypass_hint: "Local network addresses (192.168.x.x, 10.x.x.x, 172.16–31.x.x, link-local, IPv6 ULA) go directly instead of through the VPN, so printers, NAS and the router stay reachable. Addresses inside the tunnel itself still go through the VPN. Applies to tunnels that route all traffic through the VPN.",
+    local_network: "Local network",
+    lan_direct: "directly, bypassing the VPN",
+    lan_via_vpn: "through the VPN",
+    show_details: "details",
+    hide_details: "hide",
+    awg_junk: "Junk packets",
+    awg_junk_fmt: "{} packets, {} bytes (Jc, Jmin–Jmax)",
+    awg_padding: "Padding, bytes",
+    awg_headers: "Headers",
+    awg_imitation: "Protocol imitation",
 };
 
 pub fn detect_ru() -> bool {
