@@ -1,6 +1,6 @@
 [package]
 name = "awg-gui"
-version = "0.1.0-beta"
+version = "0.2.0-beta"
 edition = "2024"
 rust-version = "1.95"
 description = "AmneziaWG VPN client with a graphical interface for Linux"

@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod clock;
 mod config;
 mod desktop;
 mod helper;
@@ -7,12 +8,16 @@ mod i18n;
 mod import;
 mod instance;
 mod keys;
+mod logfile;
 mod logo;
+mod notify;
 mod proto;
 mod store;
 mod system_theme;
 mod tray;
+mod update;
 mod waker;
+mod zip;
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -22,15 +27,17 @@ Usage:
   awg-gui                 start the graphical interface
   awg-gui --minimized     start in the system tray (used for autostart)
   awg-gui --install       add the app to the desktop application menu
-  awg-gui --import FILE…  import .conf files / files with vpn:// keys and exit
+  awg-gui --import FILE…  import .conf / .zip files / files with vpn:// keys and exit
   awg-gui --version
   awg-gui --helper        (internal) privileged helper, started via pkexec
+  awg-gui --boot          (internal) restore the tunnel at boot, run by awg-gui-boot.service
 ";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--helper") => std::process::exit(helper::run()),
+        Some("--boot") => std::process::exit(helper::boot()),
         Some("--version" | "-V") => {
             println!("awg-gui {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -79,6 +86,7 @@ fn main() {
         eprintln!("warning: single-instance socket: {e}");
     }
     desktop::ensure_installed();
+    desktop::refresh_autostart();
     let tray = tray::Tray::spawn(tx, waker.clone());
     let sys_theme = system_theme::spawn(waker.clone());
     let app = Rc::new(RefCell::new(app::App::new(rx, waker, tray, sys_theme)));
@@ -153,10 +161,16 @@ fn cli_import(files: &[String]) -> i32 {
         match import::from_file(std::path::Path::new(f)) {
             Ok(cands) => {
                 for c in cands {
-                    if let Err(e) = config::validate(&c.text) {
-                        eprintln!("{f}: {e}");
-                        rc = 1;
-                        continue;
+                    let conf = match config::validate(&c.text) {
+                        Ok(conf) => conf,
+                        Err(e) => {
+                            eprintln!("{f}: {e}");
+                            rc = 1;
+                            continue;
+                        }
+                    };
+                    for (k, v) in conf.scripts() {
+                        eprintln!("{f}: warning: runs as root: {k} = {v}");
                     }
                     let name = store.unique_name(&c.name_hint, &added);
                     match store.save(&name, &c.text) {

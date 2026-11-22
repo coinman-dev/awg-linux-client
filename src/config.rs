@@ -53,6 +53,13 @@ pub const AWG3_KEYS: &[&str] = &[
 ];
 /// AmneziaWG 3.1 interface parameters.
 pub const AWG31_KEYS: &[&str] = &["RandomTrailers", "DisableCookies"];
+pub const SCRIPT_KEYS: &[&str] = &["PreUp", "PostUp", "PreDown", "PostDown"];
+
+/// `[Interface]` / `[Peer]` header of a line (comments and spaces ignored).
+fn section_header(line: &str) -> Option<&str> {
+    let code = line.split('#').next().unwrap_or("").trim();
+    code.strip_prefix('[')?.strip_suffix(']').map(str::trim)
+}
 
 impl Conf {
     pub fn interface(&self) -> Option<&Section> {
@@ -96,6 +103,23 @@ impl Conf {
         self.peers().any(|p| p.list("AllowedIPs").iter().any(|a| a.ends_with("/0")))
     }
 
+    /// awg-quick's fwmark policy routing is used (full tunnel, `Table` unset or `auto`);
+    /// LAN bypass and the kill-switch build on it.
+    pub fn uses_policy_routing(&self) -> bool {
+        let table = self.interface().and_then(|i| i.get("Table")).unwrap_or("auto");
+        self.is_full_tunnel() && table.eq_ignore_ascii_case("auto")
+    }
+
+    /// User hooks (PreUp/PostUp/PreDown/PostDown) — awg-quick runs them as root.
+    pub fn scripts(&self) -> Vec<(String, String)> {
+        let Some(i) = self.interface() else { return vec![] };
+        i.entries
+            .iter()
+            .filter(|(k, _)| SCRIPT_KEYS.iter().any(|s| s.eq_ignore_ascii_case(k)))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     pub fn is_awg(&self) -> bool {
         self.interface()
             .map(|i| AWG_KEYS.iter().chain(AWG3_KEYS).chain(AWG31_KEYS).any(|k| i.get(k).is_some()))
@@ -114,8 +138,7 @@ pub fn parse(text: &str) -> Result<Conf, String> {
         if line.is_empty() {
             continue;
         }
-        if line.starts_with('[') && line.ends_with(']') {
-            let name = line[1..line.len() - 1].trim();
+        if let Some(name) = section_header(line) {
             if !name.eq_ignore_ascii_case("Interface") && !name.eq_ignore_ascii_case("Peer") {
                 return Err(format!("line {}: unknown section [{}]", n + 1, name));
             }
@@ -146,7 +169,38 @@ pub fn validate(text: &str) -> Result<Conf, String> {
         Some(k) if keys::decode_key(k).is_none() => return Err("PrivateKey is not a valid key".into()),
         _ => {}
     }
+    for a in iface.list("Address") {
+        if parse_net(&a).is_none() {
+            return Err(format!("[Interface] Address: “{a}” is not an IP address or IP/prefix"));
+        }
+    }
+    for d in iface.list("DNS") {
+        let host_ok = !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c));
+        if d.parse::<std::net::IpAddr>().is_err() && !host_ok {
+            return Err(format!("[Interface] DNS: “{d}” is not an IP address or search domain"));
+        }
+    }
+    for k in ["ListenPort", "MTU"] {
+        if let Some(v) = iface.get(k)
+            && v.parse::<u16>().is_err() {
+                return Err(format!("[Interface] {k}: “{v}” is not a number (0–65535)"));
+            }
+    }
     for (i, p) in conf.peers().enumerate() {
+        let n = i + 1;
+        for a in p.list("AllowedIPs") {
+            if parse_net(&a).is_none() {
+                return Err(format!("[Peer] #{n} AllowedIPs: “{a}” is not an IP address or IP/prefix"));
+            }
+        }
+        if let Some(e) = p.get("Endpoint")
+            && !valid_endpoint(e) {
+                return Err(format!("[Peer] #{n} Endpoint: “{e}” must be host:port or [IPv6]:port"));
+            }
+        if let Some(k) = p.get("PersistentKeepalive")
+            && !k.eq_ignore_ascii_case("off") && k.parse::<u16>().is_err() {
+                return Err(format!("[Peer] #{n} PersistentKeepalive: “{k}” is not a number or off"));
+            }
         match p.get("PublicKey") {
             None => return Err(format!("[Peer] #{} has no PublicKey", i + 1)),
             Some(k) if keys::decode_key(k).is_none() => {
@@ -154,13 +208,23 @@ pub fn validate(text: &str) -> Result<Conf, String> {
             }
             _ => {}
         }
-        if let Some(k) = p.get("PresharedKey") {
-            if keys::decode_key(k).is_none() {
+        if let Some(k) = p.get("PresharedKey")
+            && keys::decode_key(k).is_none() {
                 return Err(format!("[Peer] #{}: PresharedKey is not a valid key", i + 1));
             }
-        }
     }
     Ok(conf)
+}
+
+fn valid_endpoint(e: &str) -> bool {
+    let Some((host, port)) = e.rsplit_once(':') else { return false };
+    if port.parse::<u16>().map(|p| p == 0).unwrap_or(true) {
+        return false;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c))
 }
 
 /// Private / local destinations that "LAN bypass" sends around the tunnel.
@@ -207,16 +271,29 @@ fn in_lan(ip: std::net::IpAddr) -> bool {
     })
 }
 
-/// Runtime copy of a full-tunnel config where local networks bypass the VPN.
-/// Adds PostUp/PreDown hooks with `ip rule`s that run before awg-quick's
-/// policy routing: private destinations use the main table, except the tunnel's
-/// own addresses, private DNS servers and private AllowedIPs, which stay in it.
-/// The saved config is not changed.
-pub fn with_lan_bypass(text: &str) -> String {
-    let Ok(conf) = parse(text) else { return text.to_string() };
-    if !conf.is_full_tunnel() {
-        return text.to_string();
-    }
+/// nftables table of the kill-switch (one tunnel is active at a time).
+pub const KILL_SWITCH_TABLE: &str = "awg_gui_ks";
+/// First line of the hooks added by awg-gui (marks a runtime config).
+const HOOKS_MARK: &str = "# awg-gui runtime hooks";
+
+/// Options applied to the config given to awg-quick (the saved config is not changed).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Runtime {
+    /// Private destinations go around the tunnel.
+    pub lan_bypass: bool,
+    /// Block traffic that does not go through the tunnel (nftables).
+    pub kill_switch: bool,
+}
+
+/// Is the kill-switch part of this runtime config?
+pub fn has_kill_switch(runtime_text: &str) -> bool {
+    runtime_text.contains(HOOKS_MARK) && runtime_text.contains(KILL_SWITCH_TABLE)
+}
+
+/// LAN bypass: `ip rule`s checked before awg-quick's policy routing: private
+/// destinations use the main table, except the tunnel's own addresses, private DNS
+/// servers and private AllowedIPs, which stay in the tunnel.
+fn lan_bypass_hooks(conf: &Conf) -> (String, String) {
     let iface = conf.interface().cloned().unwrap_or_default();
     let mut keep: Vec<String> = vec![];
     let mut candidates = iface.list("Address");
@@ -248,12 +325,56 @@ pub fn with_lan_bypass(text: &str) -> String {
         }
     }
     down += "true";
-    let hooks = format!("# awg-gui: local networks bypass the VPN\nPostUp = {up}\nPreDown = {down}\n");
+    (up, down)
+}
+
+/// Kill-switch: an nftables output chain that drops everything except loopback,
+/// the tunnel interface, the tunnel's own encrypted packets (marked with
+/// awg-quick's fwmark), DHCP/DHCPv6 and IPv6 neighbour discovery — and, with LAN
+/// bypass, private destinations. Fails the activation if it cannot be set up.
+/// awg-quick runs hooks under `set -e`: every command that may fail needs `|| true`.
+fn kill_switch_hooks(lan_bypass: bool) -> (String, String) {
+    let t = KILL_SWITCH_TABLE;
+    let mut rules = String::from(
+        "oifname lo accept; oifname \\\"%i\\\" accept; meta mark $m accept; \
+         udp sport 68 udp dport 67 accept; udp sport 546 udp dport 547 accept; \
+         icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept; ",
+    );
+    if lan_bypass {
+        rules += &format!("ip daddr {{ {} }} accept; ", LAN_V4.join(", "));
+        rules += &format!("ip6 daddr {{ {} }} accept; ", LAN_V6.join(", "));
+    }
+    let up = format!(
+        "f=$(awg show %i fwmark); [ \"$f\" != off ] || {{ echo 'kill-switch: no fwmark' >&2; exit 1; }}; \
+         m=$(printf %d \"$f\"); nft delete table inet {t} 2>/dev/null || true; \
+         nft -f - <<< \"table inet {t} {{ chain out {{ type filter hook output priority 0; policy drop; {rules}}}; }}\""
+    );
+    let down = format!("nft delete table inet {t} 2>/dev/null || true");
+    (up, down)
+}
+
+/// The config actually given to awg-quick: the saved text plus PostUp/PreDown hooks
+/// for the enabled options. Both options apply only to full-tunnel configs that use
+/// awg-quick's policy routing; otherwise the text is returned unchanged.
+pub fn runtime_config(text: &str, opts: Runtime) -> String {
+    let Ok(conf) = parse(text) else { return text.to_string() };
+    if !conf.uses_policy_routing() || !(opts.lan_bypass || opts.kill_switch) {
+        return text.to_string();
+    }
+    let mut hooks = format!("{HOOKS_MARK}\n");
+    if opts.lan_bypass {
+        let (up, down) = lan_bypass_hooks(&conf);
+        hooks += &format!("PostUp = {up}\nPreDown = {down}\n");
+    }
+    if opts.kill_switch {
+        let (up, down) = kill_switch_hooks(opts.lan_bypass);
+        hooks += &format!("PostUp = {up}\nPreDown = {down}\n");
+    }
     let mut out = String::new();
     let mut done = false;
     for line in text.split_inclusive('\n') {
         out.push_str(line);
-        if !done && line.trim().eq_ignore_ascii_case("[Interface]") {
+        if !done && section_header(line).map(|h| h.eq_ignore_ascii_case("Interface")).unwrap_or(false) {
             if !line.ends_with('\n') {
                 out.push('\n');
             }
@@ -262,6 +383,11 @@ pub fn with_lan_bypass(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+fn with_lan_bypass(text: &str) -> String {
+    runtime_config(text, Runtime { lan_bypass: true, kill_switch: false })
 }
 
 /// Linux interface names: max 15 chars from [a-zA-Z0-9_=+.-] (awg-quick rule).
@@ -326,6 +452,81 @@ mod tests {
         let split = t.replace("0.0.0.0/0, ::/0", "10.0.0.0/24");
         assert_eq!(with_lan_bypass(&split), split);
         assert_eq!(normalize_net("10.0.0.7".parse().unwrap(), 24), "10.0.0.0/24");
+    }
+
+    fn check_bash(out: &str) {
+        let iface = parse(out).unwrap().interface().cloned().unwrap();
+        for (k, v) in &iface.entries {
+            if k == "PostUp" || k == "PreDown" {
+                let cmd = v.replace("%i", "awg0");
+                assert!(!cmd.contains('#'), "awg-quick strips everything after #: {cmd}");
+                let st = std::process::Command::new("bash").args(["-n", "-c", &cmd]).status().unwrap();
+                assert!(st.success(), "{k} is not valid bash: {cmd}");
+                // awg-quick runs hooks as `(eval "$hook")` under `set -e`: run them that way
+                // with stubs that fail like the real tools do when there is nothing to delete.
+                let stubs = "awg() { echo 51820; }; \
+                    ip() { case \"$*\" in *' rule del '*) return 2;; esac; }; \
+                    nft() { case \"$1\" in -f) cat >/dev/null;; *) return 1;; esac; }";
+                let script = format!("set -e -o pipefail; {stubs}; (eval \"$0\")");
+                let st = std::process::Command::new("bash").args(["-c", &script, &cmd]).status().unwrap();
+                assert!(st.success(), "{k} fails under set -e: {cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn kill_switch() {
+        let t = "[Interface] # main\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nAddress = 10.66.66.2/32\n\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 0.0.0.0/0\n";
+        let out = runtime_config(t, Runtime { lan_bypass: true, kill_switch: true });
+        validate(&out).unwrap();
+        assert!(has_kill_switch(&out));
+        assert!(out.contains("rule add to 192.168.0.0/16 lookup main"), "hooks follow a commented [Interface] line");
+        assert!(out.contains("policy drop"));
+        assert!(out.contains("ip daddr { 10.0.0.0/8"));
+        check_bash(&out);
+        // the nft ruleset itself (what bash passes to `nft -f -`)
+        let up = parse(&out).unwrap().interface().unwrap().entries.iter().rev()
+            .find(|(k, _)| k == "PostUp").unwrap().1.clone();
+        let script = format!("m=51820; {}; echo \"$r\"", up.split("<<< ").nth(1).map(|r| format!("r={}", r.replace("%i", "awg0"))).unwrap());
+        let rules = std::process::Command::new("bash").args(["-c", &script]).output().unwrap();
+        let rules = String::from_utf8(rules.stdout).unwrap();
+        assert!(rules.contains("oifname \"awg0\" accept; meta mark 51820 accept;"), "{rules}");
+        // load it for real in a throwaway network namespace when possible
+        let nft_ok = std::process::Command::new("unshare").args(["-rn", "nft", "list", "ruleset"]).output()
+            .map(|o| o.status.success()).unwrap_or(false);
+        if nft_ok {
+            let st = std::process::Command::new("unshare")
+                .args(["-rn", "bash", "-c", &format!("nft -f - <<< \"$0\" && nft list table inet {KILL_SWITCH_TABLE} >/dev/null"), rules.trim()])
+                .status().unwrap();
+            assert!(st.success(), "nft rejected the kill-switch ruleset: {rules}");
+        }
+        // without LAN bypass private networks are blocked too
+        let ks = runtime_config(t, Runtime { lan_bypass: false, kill_switch: true });
+        assert!(!ks.contains("ip daddr") && !ks.contains("lookup main"));
+        check_bash(&ks);
+        // Table = off / split tunnel: unchanged
+        let off = t.replace("Address", "Table = off\nAddress");
+        assert_eq!(runtime_config(&off, Runtime { lan_bypass: true, kill_switch: true }), off);
+        let split = t.replace("0.0.0.0/0", "10.0.0.0/24");
+        assert_eq!(runtime_config(&split, Runtime { lan_bypass: true, kill_switch: true }), split);
+        assert!(!has_kill_switch(t));
+    }
+
+    #[test]
+    fn values() {
+        let base = "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\n";
+        let peer = "[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\n";
+        let ok = |extra_i: &str, extra_p: &str| validate(&format!("{base}{extra_i}{peer}{extra_p}"));
+        assert!(ok("Address = 10.0.0.2/32, fd00::2/128\nDNS = 1.1.1.1, corp.example\nMTU = 1420\n", "Endpoint = vpn.example.com:51820\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n").is_ok());
+        assert!(ok("", "Endpoint = [2001:db8::1]:51820\n").is_ok());
+        assert!(ok("Address = 10.0.0.300/32\n", "").is_err());
+        assert!(ok("MTU = big\n", "").is_err());
+        assert!(ok("", "AllowedIPs = 0.0.0.0/33\n").is_err());
+        assert!(ok("", "Endpoint = 1.2.3.4\n").is_err());
+        assert!(ok("", "Endpoint = 2001:db8::1:51820\n").is_err());
+        assert!(ok("", "PersistentKeepalive = soon\n").is_err());
+        let c = parse(&format!("{base}PostUp = iptables -A x\npostdown = true\n")).unwrap();
+        assert_eq!(c.scripts().len(), 2);
     }
 
     #[test]

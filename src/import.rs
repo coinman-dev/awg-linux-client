@@ -17,9 +17,45 @@ pub struct Candidate {
 
 pub fn from_file(path: &Path) -> Result<Vec<Candidate>, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let text = String::from_utf8_lossy(&data);
+    if crate::zip::is_zip(&data) {
+        return from_zip(&data).map_err(|e| format!("{}: {e}", path.display()));
+    }
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    from_text(&text, &stem).map_err(|e| format!("{}: {e}", path.display()))
+    from_text(&decode_text(&data), &stem).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Every `.conf` file of a zip archive (e.g. made by "Export all tunnels to zip").
+fn from_zip(data: &[u8]) -> Result<Vec<Candidate>, String> {
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    for (name, content) in crate::zip::read(data)? {
+        let file = name.rsplit('/').next().unwrap_or(&name);
+        let Some(stem) = file.strip_suffix(".conf").or_else(|| file.strip_suffix(".CONF")) else { continue };
+        match from_text(&decode_text(&content), stem) {
+            Ok(c) => out.extend(c),
+            Err(e) => errors.push(format!("{file}: {e}")),
+        }
+    }
+    if out.is_empty() {
+        return Err(if errors.is_empty() { "no .conf files in the archive".into() } else { errors.join("; ") });
+    }
+    Ok(out)
+}
+
+/// UTF-8, or UTF-16 with a byte order mark (Windows Notepad).
+fn decode_text(data: &[u8]) -> String {
+    let utf16 = |be: bool| {
+        let units: Vec<u16> = data[2..]
+            .as_chunks::<2>().0.iter()
+            .map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match data {
+        [0xff, 0xfe, ..] => utf16(false),
+        [0xfe, 0xff, ..] => utf16(true),
+        _ => String::from_utf8_lossy(data).to_string(),
+    }
 }
 
 /// Accepts a raw .conf, a `vpn://...` key, or AmneziaVPN JSON.
@@ -28,7 +64,7 @@ pub fn from_text(text: &str, name_hint: &str) -> Result<Vec<Candidate>, String> 
     if t.is_empty() {
         return Err("empty input".into());
     }
-    if t.contains("[Interface]") || t.contains("[interface]") {
+    if t.to_ascii_lowercase().contains("[interface]") {
         return Ok(vec![Candidate { name_hint: name_hint.to_string(), text: normalize(t) }]);
     }
     if let Some(rest) = t.strip_prefix("vpn://") {
@@ -113,15 +149,14 @@ fn collect_configs(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::Object(map) => {
             for (k, val) in map {
-                if k == "last_config" {
-                    if let Some(s) = val.as_str() {
-                        if let Ok(inner) = serde_json::from_str::<Value>(s) {
-                            if let Some(c) = config_from_last_config(&inner) {
-                                out.push(c);
-                                continue;
-                            }
-                        }
-                    }
+                if k == "last_config"
+                    && let Some(c) = val
+                        .as_str()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .and_then(|inner| config_from_last_config(&inner))
+                {
+                    out.push(c);
+                    continue;
                 }
                 collect_configs(val, out);
             }
@@ -133,10 +168,14 @@ fn collect_configs(v: &Value, out: &mut Vec<String>) {
 }
 
 fn config_from_last_config(v: &Value) -> Option<String> {
-    if let Some(c) = v.get("config").and_then(Value::as_str) {
-        if c.contains("[Interface]") {
-            return Some(c.to_string());
-        }
+    let mtu = v.get("mtu").and_then(|m| m.as_str().map(str::to_string).or_else(|| m.as_u64().map(|n| n.to_string())));
+    if let Some(c) = v.get("config").and_then(Value::as_str).filter(|c| c.contains("[Interface]")) {
+        // The ready config may lack the MTU the server chose (it is a separate field).
+        let has_mtu = c.lines().any(|l| l.split('=').next().unwrap_or("").trim().eq_ignore_ascii_case("MTU"));
+        return Some(match mtu.filter(|m| !has_mtu && m.parse::<u16>().is_ok()) {
+            Some(m) => c.replacen("[Interface]", &format!("[Interface]\nMTU = {m}"), 1),
+            None => c.to_string(),
+        });
     }
     // Build from separate fields (older AmneziaVPN exports).
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
@@ -151,7 +190,7 @@ fn config_from_last_config(v: &Value) -> Option<String> {
         c += &format!("Address = {ip}\n");
     }
     c += "DNS = $PRIMARY_DNS, $SECONDARY_DNS\n";
-    if let Some(mtu) = s("mtu") {
+    if let Some(mtu) = mtu {
         c += &format!("MTU = {mtu}\n");
     }
     for (json_key, conf_key) in [
@@ -206,7 +245,7 @@ mod tests {
     #[test]
     fn vpn_key_roundtrip() {
         let conf = "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\n\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\n";
-        let last = serde_json::json!({ "config": conf }).to_string();
+        let last = serde_json::json!({ "config": conf, "mtu": "1376" }).to_string();
         let root = serde_json::json!({
             "containers": [{ "awg": { "last_config": last }, "container": "amnezia-awg" }],
             "description": "My Server", "dns1": "9.9.9.9", "dns2": "8.8.8.8"
@@ -221,6 +260,23 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].name_hint, "My Server");
         assert!(c[0].text.contains("DNS = 9.9.9.9, 8.8.8.8"));
+        assert!(c[0].text.contains("[Interface]\nMTU = 1376\n"), "{}", c[0].text);
         crate::config::validate(&c[0].text).unwrap();
+    }
+
+    #[test]
+    fn zip_and_utf16() {
+        let conf = "[INTERFACE]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\n";
+        let z = crate::zip::write(
+            &[("x/home.conf".into(), conf.as_bytes().to_vec()), ("readme.txt".into(), b"hi".to_vec())],
+            0,
+        )
+        .unwrap();
+        let c = from_zip(&z).unwrap();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name_hint, "home");
+        let mut u16 = vec![0xff, 0xfe];
+        u16.extend(conf.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        assert_eq!(decode_text(&u16), conf);
     }
 }

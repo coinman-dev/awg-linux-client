@@ -25,14 +25,48 @@ fn warn(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode { YELLOW } else { AMBER_DARK }
 }
 
+/// Version of settings.json. Files older than 2 (or none at all) get the current
+/// defaults of the options below: LAN bypass and kill-switch on.
+const SETTINGS_VERSION: u32 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Settings {
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     lang: Option<String>,
     #[serde(default)]
     theme: Option<String>,
     #[serde(default)]
     lan_bypass: bool,
+    #[serde(default)]
+    kill_switch: bool,
+    #[serde(default)]
+    boot_connect: bool,
+    /// Look for a newer release on GitHub once a day (off by default).
+    #[serde(default)]
+    check_updates: bool,
+    /// Unix time of the last update check.
+    #[serde(default)]
+    update_checked_at: u64,
+    /// Newer release found by the last check.
+    #[serde(default)]
+    known_update: Option<crate::update::Release>,
+    /// Version already announced with a notification.
+    #[serde(default)]
+    notified_update: Option<String>,
+}
+
+fn load_settings(json: Option<&str>) -> Settings {
+    let mut settings: Settings = json.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+    if settings.version < SETTINGS_VERSION {
+        // Defaults: local devices reachable, nothing leaks if the tunnel dies.
+        // (0.1.0-beta saved lan_bypass = false for everyone; turning on only the
+        // kill-switch would cut those users off from their local network.)
+        settings.lan_bypass = true;
+        settings.kill_switch = true;
+    }
+    settings
 }
 
 fn theme_from(s: Option<&str>) -> egui::ThemePreference {
@@ -69,11 +103,19 @@ enum Dialog {
     Editor { original: Option<String>, name: String, text: String, error: Option<String> },
     Paste { text: String, error: Option<String> },
     ConfirmDelete(String),
+    /// Imported configs contain PreUp/PostUp/... commands (run as root).
+    ConfirmScripts { cands: Vec<import::Candidate>, scripts: Vec<String> },
+    About,
 }
+
+/// (started by the user, newer release or error)
+type UpdateResult = (bool, Result<Option<crate::update::Release>, String>);
 
 enum FileResult {
     Import(Vec<PathBuf>),
     Export(String, PathBuf),
+    ExportAll(PathBuf),
+    SaveLog(PathBuf),
 }
 
 #[derive(Clone, Copy)]
@@ -115,6 +157,23 @@ pub struct App {
     autostart: bool,
     debug: String,
     lan_bypass: bool,
+    kill_switch: bool,
+    boot_connect: bool,
+    /// The kill-switch blocks traffic although no tunnel is up (from the helper).
+    blocked: bool,
+    /// Tunnel activated last (offered by "Reconnect" when the kill-switch blocks).
+    last_active: Option<String>,
+    /// A window is open (notifications are sent only while it is not).
+    window_open: bool,
+    /// Last status polling error (logged once, not every second).
+    status_error: Option<String>,
+    check_updates: bool,
+    update_checked_at: u64,
+    /// A newer release is available.
+    update: Option<crate::update::Release>,
+    notified_update: Option<String>,
+    /// Running update check: (started by the user, result).
+    update_rx: Option<Receiver<UpdateResult>>,
     awg_expanded: bool,
     sys_theme: crate::system_theme::SystemTheme,
     /// System theme last given to the current egui context.
@@ -124,10 +183,7 @@ pub struct App {
 impl App {
     pub fn new(events: Receiver<UiEvent>, waker: Waker, tray: Option<Tray>, sys_theme: crate::system_theme::SystemTheme) -> Self {
         let store = Store::open().expect("cannot create ~/.config/awg-gui");
-        let settings: Settings = std::fs::read_to_string(store.dir.parent().unwrap().join("settings.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let settings = load_settings(std::fs::read_to_string(store.dir.parent().unwrap().join("settings.json")).ok().as_deref());
         let ru = settings.lang.as_deref().map(|l| l == "ru").unwrap_or_else(crate::i18n::detect_ru);
         let theme = match std::env::var("AWG_GUI_THEME").ok() {
             Some(t) => theme_from(Some(&t)),
@@ -146,7 +202,7 @@ impl App {
             busy: HashMap::new(),
             active: HashSet::new(),
             last_scan: Instant::now() - Duration::from_secs(10),
-            log: vec![],
+            log: crate::logfile::load(),
             toast: None,
             dialog: None,
             file_rx: None,
@@ -161,6 +217,17 @@ impl App {
             show_requested: false,
             autostart: crate::desktop::autostart_enabled(),
             lan_bypass: settings.lan_bypass,
+            kill_switch: settings.kill_switch,
+            boot_connect: settings.boot_connect,
+            blocked: false,
+            last_active: None,
+            window_open: false,
+            status_error: None,
+            check_updates: settings.check_updates,
+            update_checked_at: settings.update_checked_at,
+            update: settings.known_update.clone().filter(|u| crate::update::is_newer(&u.version)),
+            notified_update: settings.notified_update.clone(),
+            update_rx: None,
             awg_expanded: false,
             sys_theme,
             applied_sys_theme: None,
@@ -177,11 +244,10 @@ impl App {
         if dbg.contains("helper") {
             app.send(Request::Status);
         }
-        if dbg.contains("editor") {
-            if let Some(t) = app.selected.clone().and_then(|s| app.tunnel(&s).cloned()) {
+        if dbg.contains("editor")
+            && let Some(t) = app.selected.clone().and_then(|s| app.tunnel(&s).cloned()) {
                 app.dialog = Some(Dialog::Editor { original: Some(t.name.clone()), name: t.name, text: t.text, error: None });
             }
-        }
         if dbg.contains("paste") {
             app.dialog = Some(Dialog::Paste { text: String::new(), error: None });
         }
@@ -237,6 +303,7 @@ impl App {
         self.show_requested = false;
         self.screenshot = std::env::var_os("AWG_GUI_SCREENSHOT").map(|p| (PathBuf::from(p), 0));
         self.waker.set(Some(ctx.clone()));
+        self.window_open = true;
     }
 
     /// "System" theme: egui falls back to `fallback_theme` because winit reports no
@@ -253,6 +320,7 @@ impl App {
     /// Called after the window has been closed.
     pub fn detach(&mut self) {
         self.waker.set(None);
+        self.window_open = false;
         self.logo = None;
         if self.debug.contains("reopened") && !self.debug.contains("reshow") {
             self.debug.push_str(",reshow");
@@ -264,21 +332,15 @@ impl App {
     /// Background work; runs every frame and also while the window is closed.
     pub fn tick(&mut self) {
         while let Ok(ev) = self.events.try_recv() {
-            match ev {
-                UiEvent::Show => self.show_requested = true,
-                UiEvent::Quit => self.quit = true,
-                UiEvent::Reload => self.reload(),
-                UiEvent::Toggle(name) => {
-                    if self.active.contains(&name) {
-                        self.deactivate(&name);
-                    } else {
-                        self.activate(&name);
-                    }
-                }
-            }
+            self.handle_event(ev);
         }
         self.poll_helper();
         self.poll_files();
+        self.poll_update();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if self.check_updates && self.update_rx.is_none() && now.saturating_sub(self.update_checked_at) >= 86400 {
+            self.start_update_check(false);
+        }
         if self.last_scan.elapsed() > Duration::from_millis(1000) {
             self.scan_active();
         }
@@ -288,21 +350,35 @@ impl App {
     /// Block (with a timeout) until something happens while the window is closed.
     pub fn wait(&mut self, timeout: Duration) {
         if let Ok(ev) = self.events.recv_timeout(timeout) {
-            // put it back in front of the queue by handling it right away
-            match ev {
-                UiEvent::Show => self.show_requested = true,
-                UiEvent::Quit => self.quit = true,
-                UiEvent::Reload => self.reload(),
-                UiEvent::Toggle(name) => {
-                    if self.active.contains(&name) {
-                        self.deactivate(&name);
-                    } else {
-                        self.activate(&name);
-                    }
-                }
-            }
+            self.handle_event(ev);
         }
         self.tick();
+    }
+
+    fn handle_event(&mut self, ev: UiEvent) {
+        match ev {
+            UiEvent::Show => self.show_requested = true,
+            UiEvent::Quit => self.quit = true,
+            UiEvent::Reload => self.reload(),
+            UiEvent::Toggle(name) => self.toggle(&name),
+            UiEvent::Import => {
+                self.show_requested = true;
+                self.tab = Tab::Tunnels;
+                self.pick_import_files();
+            }
+            UiEvent::About => {
+                self.show_requested = true;
+                self.dialog = Some(Dialog::About);
+            }
+        }
+    }
+
+    fn toggle(&mut self, name: &str) {
+        if self.active.contains(name) {
+            self.deactivate(name);
+        } else {
+            self.activate(name);
+        }
     }
 
     fn update_tray(&mut self) {
@@ -313,6 +389,14 @@ impl App {
                 .iter()
                 .map(|t| (t.name.clone(), self.active.contains(&t.name), self.busy.contains_key(&t.name)))
                 .collect(),
+            addresses: self
+                .tunnels
+                .iter()
+                .filter(|t| self.active.contains(&t.name))
+                .filter_map(|t| config::parse(&t.text).ok())
+                .flat_map(|c| c.interface().map(|i| i.list("Address")).unwrap_or_default())
+                .collect(),
+            update: self.update.clone(),
         };
         if let Some(t) = &mut self.tray {
             t.set(state);
@@ -331,14 +415,20 @@ impl App {
     }
 
     fn logln(&mut self, s: impl AsRef<str>) {
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + local_offset();
-        let t = t.rem_euclid(86400);
-        let (h, m, sec) = (t / 3600, (t / 60) % 60, t % 60);
-        for line in s.as_ref().lines().filter(|l| !l.trim().is_empty()) {
-            self.log.push(format!("{h:02}:{m:02}:{sec:02}  {line}"));
-        }
-        if self.log.len() > 5000 {
+        let stamp = crate::clock::stamp(crate::clock::now_local());
+        let lines: Vec<String> =
+            s.as_ref().lines().filter(|l| !l.trim().is_empty()).map(|l| format!("{stamp}  {l}")).collect();
+        crate::logfile::append(&lines);
+        self.log.extend(lines);
+        if self.log.len() > crate::logfile::KEEP_LINES {
             self.log.drain(..1000);
+        }
+    }
+
+    /// Desktop notification, only while the window is closed (unless `always`).
+    fn notify(&self, summary: &str, body: String, urgent: bool, always: bool) {
+        if (always || !self.window_open) && self.screenshot.is_none() {
+            crate::notify::send(summary.to_string(), body, urgent);
         }
     }
 
@@ -351,16 +441,16 @@ impl App {
     fn error(&mut self, s: impl Into<String>) {
         let s = s.into();
         self.logln(format!("ERROR: {s}"));
+        self.notify(self.tr().n_error_title, s.clone(), true, false);
         self.toast = Some((s, true, Instant::now()));
     }
 
     fn reload(&mut self) {
         self.tunnels = self.store.list();
-        if let Some(s) = &self.selected {
-            if !self.tunnels.iter().any(|t| &t.name == s) {
+        if let Some(s) = &self.selected
+            && !self.tunnels.iter().any(|t| &t.name == s) {
                 self.selected = self.tunnels.first().map(|t| t.name.clone());
             }
-        }
     }
 
     fn tunnel(&self, name: &str) -> Option<&Tunnel> {
@@ -370,13 +460,31 @@ impl App {
     fn scan_active(&mut self) {
         // debug builds: AWG_GUI_FAKE_ACTIVE=name1,name2 pretends these are up (screenshots)
         let fake = if cfg!(debug_assertions) { std::env::var("AWG_GUI_FAKE_ACTIVE").unwrap_or_default() } else { String::new() };
-        self.active = self
+        let now: HashSet<String> = self
             .tunnels
             .iter()
             .filter(|t| Path::new("/sys/class/net").join(&t.name).exists() || fake.split(',').any(|f| f == t.name))
             .map(|t| t.name.clone())
             .collect();
+        // A tunnel that disappeared without being deactivated here went down by itself
+        // (amneziawg-go crashed, interface removed, ...).
+        let lost: Vec<String> =
+            self.active.iter().filter(|n| !now.contains(*n) && !self.busy.contains_key(*n) && self.tunnel(n).is_some()).cloned().collect();
+        self.active = now;
         self.last_scan = Instant::now();
+        for name in lost {
+            let ks = self.kill_switch_on()
+                && self.tunnel(&name).and_then(|t| config::parse(&t.text).ok()).map(|c| c.uses_policy_routing()).unwrap_or(false);
+            let tr = self.tr();
+            let mut body = tr.n_lost.replace("{}", &name);
+            if ks {
+                body.push_str(tr.n_lost_ks);
+                self.blocked = true;
+            }
+            self.logln(format!("ERROR: {body}"));
+            self.toast = Some((body.clone(), true, Instant::now()));
+            self.notify(tr.n_lost_title, body, true, true);
+        }
     }
 
     // ---------- helper communication ----------
@@ -400,10 +508,12 @@ impl App {
                 self.busy.insert(name.clone(), Busy::Down);
             }
             Request::Status => self.status_inflight = true,
+            Request::SetBoot { .. } | Request::Unblock => {}
         }
         if !self.helper.as_ref().unwrap().send(req) {
             self.helper = None;
             self.busy.clear();
+            self.status_inflight = false;
             self.error("helper is not running");
         }
     }
@@ -430,24 +540,43 @@ impl App {
                     self.status_inflight = false;
                     self.error(msg);
                 }
+                Event::Reply(Request::Status, resp) => {
+                    self.status_inflight = false;
+                    if resp.ok {
+                        if !resp.output.trim().is_empty() {
+                            self.logln(&resp.output);
+                        }
+                        self.status_error = None;
+                        self.blocked = resp.blocked;
+                        if let Some(s) = resp.status {
+                            self.status = s.into_iter().map(|i| (i.name.clone(), i)).collect();
+                        }
+                    } else {
+                        // polled every second: log a failure once, not every time
+                        let e = resp.error.unwrap_or_default();
+                        if self.status_error.as_deref() != Some(e.as_str()) {
+                            self.logln(format!("ERROR: statistics: {e}"));
+                            self.logln(&resp.output);
+                            self.status_error = Some(e);
+                        }
+                    }
+                }
                 Event::Reply(req, resp) => {
                     if !resp.output.trim().is_empty() {
                         self.logln(&resp.output);
                     }
+                    let tr = self.tr();
                     match req {
-                        Request::Status => {
-                            self.status_inflight = false;
-                            if let Some(s) = resp.status {
-                                self.status = s.into_iter().map(|i| (i.name.clone(), i)).collect();
-                            }
-                        }
                         Request::Up { name, .. } => {
                             if self.busy.get(&name) == Some(&Busy::Up) {
                                 self.busy.remove(&name);
                             }
                             if resp.ok {
-                                self.info(format!("{name}: {}", self.tr().active));
+                                self.info(format!("{name}: {}", tr.active));
+                                self.notify(tr.n_activated_title, tr.n_activated.replace("{}", &name), false, false);
                                 self.backend = detect_backend();
+                                self.blocked = false;
+                                self.last_active = Some(name);
                             }
                         }
                         Request::Down { name, .. } => {
@@ -455,9 +584,19 @@ impl App {
                                 self.busy.remove(&name);
                             }
                             if resp.ok {
-                                self.info(format!("{name}: {}", self.tr().inactive));
+                                // gone on purpose: not "lost"
+                                self.active.remove(&name);
+                                self.blocked = false;
+                                self.info(format!("{name}: {}", tr.inactive));
+                                self.notify(tr.n_deactivated_title, tr.n_deactivated.replace("{}", &name), false, false);
                             }
                         }
+                        Request::Unblock => {
+                            if resp.ok {
+                                self.blocked = false;
+                            }
+                        }
+                        Request::SetBoot { .. } | Request::Status => {}
                     }
                     if !resp.ok {
                         self.error(resp.error.unwrap_or_else(|| "unknown error".into()));
@@ -475,29 +614,130 @@ impl App {
 
     /// The config actually given to awg-quick (the saved one is never changed).
     fn runtime_config(&self, text: &str) -> String {
-        if self.lan_bypass { config::with_lan_bypass(text) } else { text.to_string() }
+        config::runtime_config(text, config::Runtime { lan_bypass: self.lan_bypass, kill_switch: self.kill_switch_on() })
+    }
+
+    /// The kill-switch is wanted and can work. Without nftables it is not applied
+    /// (activation must not fail just because the option is on by default); the
+    /// details view says so.
+    fn kill_switch_on(&self) -> bool {
+        self.kill_switch && nft_available()
     }
 
     fn set_lan_bypass(&mut self, on: bool) {
         self.lan_bypass = on;
         self.save_settings();
-        // Re-apply to an active full-tunnel connection.
+        self.reapply_options();
+    }
+
+    fn set_kill_switch(&mut self, on: bool) {
+        self.kill_switch = on;
+        if on && !nft_available() {
+            self.error(self.tr().ks_no_nft);
+        }
+        self.save_settings();
+        self.reapply_options();
+    }
+
+    /// Reconnect an active tunnel the runtime options apply to.
+    fn reapply_options(&mut self) {
         let active: Vec<Tunnel> = self
             .tunnels
             .iter()
-            .filter(|t| self.active.contains(&t.name))
-            .filter(|t| config::parse(&t.text).map(|c| c.is_full_tunnel()).unwrap_or(false))
+            .filter(|t| self.active.contains(&t.name) && !self.busy.contains_key(&t.name))
+            .filter(|t| config::parse(&t.text).map(|c| c.uses_policy_routing()).unwrap_or(false))
             .cloned()
             .collect();
         for t in active {
             self.info(self.tr().reconnecting.replace("{}", &t.name));
             self.send(Request::Down { name: t.name.clone(), config: Some(t.text.clone()) });
             let cfg = self.runtime_config(&t.text);
-            self.send(Request::Up { name: t.name, config: cfg });
+            self.send(Request::Up { name: t.name, config: cfg, boot: self.boot_connect });
         }
     }
 
+    fn set_check_updates(&mut self, on: bool) {
+        self.check_updates = on;
+        if on {
+            self.update_checked_at = 0; // check right away
+        } else {
+            self.update = None;
+        }
+        self.save_settings();
+    }
+
+    /// Ask GitHub for releases in a thread. `manual`: the user pressed the button
+    /// (allowed even with the daily check off — that click is the consent).
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        self.update_checked_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.save_settings();
+        let (tx, rx) = channel();
+        let w = self.waker.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((manual, crate::update::check()));
+            w.wake();
+        });
+        self.update_rx = Some(rx);
+    }
+
+    fn poll_update(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        let Ok((manual, res)) = rx.try_recv() else { return };
+        self.update_rx = None;
+        let tr = self.tr();
+        match res {
+            Ok(Some(r)) => {
+                let msg = tr.update_available.replace("{}", &r.version);
+                if manual {
+                    self.info(&msg);
+                } else {
+                    self.logln(&msg);
+                }
+                if self.notified_update.as_deref() != Some(r.version.as_str()) {
+                    self.notify(tr.n_update_title, tr.n_update.replace("{}", &r.version), false, true);
+                    self.notified_update = Some(r.version.clone());
+                }
+                self.update = Some(r);
+            }
+            Ok(None) => {
+                self.update = None;
+                if manual {
+                    self.info(tr.up_to_date);
+                }
+            }
+            Err(e) => {
+                let msg = tr.update_failed.replace("{}", &e);
+                if manual {
+                    self.error(msg);
+                } else {
+                    self.logln(format!("ERROR: {msg}"));
+                    // try again in an hour instead of tomorrow
+                    self.update_checked_at = self.update_checked_at.saturating_sub(86400 - 3600);
+                }
+            }
+        }
+        self.save_settings();
+    }
+
+    fn set_boot_connect(&mut self, on: bool) {
+        self.boot_connect = on;
+        self.save_settings();
+        let active = self.tunnels.iter().find(|t| self.active.contains(&t.name)).cloned();
+        let tunnel = match (on, active) {
+            (true, Some(t)) => Some((t.name.clone(), self.runtime_config(&t.text))),
+            (true, None) => return, // remembered on the next activation
+            (false, _) => None,
+        };
+        self.send(Request::SetBoot { tunnel });
+    }
+
     fn activate(&mut self, name: &str) {
+        if self.busy.contains_key(name) {
+            return;
+        }
         let Some(t) = self.tunnel(name).cloned() else { return };
         if let Err(e) = config::validate(&t.text) {
             return self.error(format!("{name}: {e}"));
@@ -509,17 +749,34 @@ impl App {
             self.send(Request::Down { name: o.name, config: Some(o.text) });
         }
         let cfg = self.runtime_config(&t.text);
-        self.send(Request::Up { name: t.name, config: cfg });
+        self.send(Request::Up { name: t.name, config: cfg, boot: self.boot_connect });
     }
 
     fn deactivate(&mut self, name: &str) {
+        if self.busy.contains_key(name) {
+            return;
+        }
         let config = self.tunnel(name).map(|t| t.text.clone());
         self.send(Request::Down { name: name.to_string(), config });
     }
 
     // ---------- import / export ----------
 
+    /// Import, asking first if any config runs commands as root.
     fn import_candidates(&mut self, cands: Vec<import::Candidate>) {
+        let scripts: Vec<String> = cands
+            .iter()
+            .filter_map(|c| config::parse(&c.text).ok().map(|conf| (c, conf)))
+            .flat_map(|(c, conf)| conf.scripts().into_iter().map(move |(k, v)| format!("{}: {k} = {v}", c.name_hint)))
+            .collect();
+        if scripts.is_empty() {
+            self.import_confirmed(cands);
+        } else {
+            self.dialog = Some(Dialog::ConfirmScripts { cands, scripts });
+        }
+    }
+
+    fn import_confirmed(&mut self, cands: Vec<import::Candidate>) {
         let mut added: Vec<String> = vec![];
         for c in cands {
             if let Err(e) = config::validate(&c.text) {
@@ -556,7 +813,7 @@ impl App {
         let title = self.tr().conf_files;
         std::thread::spawn(move || {
             if let Some(files) = rfd::FileDialog::new()
-                .add_filter(title, &["conf", "vpn", "txt"])
+                .add_filter(title, &["conf", "zip", "vpn", "txt"])
                 .add_filter("*", &["*"])
                 .pick_files()
             {
@@ -576,6 +833,53 @@ impl App {
         self.file_rx = Some(rx);
     }
 
+    fn pick_export_all(&mut self) {
+        let (tx, rx) = channel();
+        let title = self.tr().zip_files;
+        let name = format!("awg-tunnels-{}.zip", crate::clock::file_stamp(crate::clock::now_local()));
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new().add_filter(title, &["zip"]).set_file_name(name).save_file() {
+                let p = if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) { p } else { p.with_extension("zip") };
+                let _ = tx.send(FileResult::ExportAll(p));
+            }
+        });
+        self.file_rx = Some(rx);
+    }
+
+    fn pick_save_log(&mut self) {
+        let (tx, rx) = channel();
+        let title = self.tr().text_files;
+        let name = format!("awg-gui-log-{}.txt", crate::clock::file_stamp(crate::clock::now_local()));
+        std::thread::spawn(move || {
+            if let Some(p) = rfd::FileDialog::new().add_filter(title, &["txt"]).set_file_name(name).save_file() {
+                let _ = tx.send(FileResult::SaveLog(p));
+            }
+        });
+        self.file_rx = Some(rx);
+    }
+
+    /// Write a private file (configs contain keys): mode 0600.
+    fn write_private(&mut self, path: &Path, data: &[u8]) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+        let res = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, data));
+        match res {
+            Ok(()) => {
+                self.info(self.tr().exported.replace("{}", &path.display().to_string()));
+                true
+            }
+            Err(e) => {
+                self.error(format!("{}: {e}", path.display()));
+                false
+            }
+        }
+    }
+
     fn poll_files(&mut self) {
         let Some(rx) = &self.file_rx else { return };
         let Ok(r) = rx.try_recv() else { return };
@@ -583,19 +887,22 @@ impl App {
         match r {
             FileResult::Import(paths) => self.import_paths(paths),
             FileResult::Export(name, path) => {
-                let Some(t) = self.tunnel(&name) else { return };
-                use std::os::unix::fs::OpenOptionsExt;
-                let res = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .and_then(|mut f| std::io::Write::write_all(&mut f, t.text.as_bytes()));
-                match res {
-                    Ok(()) => self.info(self.tr().exported.replace("{}", &path.display().to_string())),
-                    Err(e) => self.error(format!("{}: {e}", path.display())),
+                let Some(t) = self.tunnel(&name).cloned() else { return };
+                self.write_private(&path, t.text.as_bytes());
+            }
+            FileResult::ExportAll(path) => {
+                let entries: Vec<(String, Vec<u8>)> =
+                    self.tunnels.iter().map(|t| (format!("{}.conf", t.name), t.text.clone().into_bytes())).collect();
+                match crate::zip::write(&entries, crate::clock::now_local()) {
+                    Ok(z) => {
+                        self.write_private(&path, &z);
+                    }
+                    Err(e) => self.error(e.to_string()),
                 }
+            }
+            FileResult::SaveLog(path) => {
+                let text = self.log.join("\n") + "\n";
+                self.write_private(&path, text.as_bytes());
             }
         }
     }
@@ -628,13 +935,11 @@ impl App {
             return;
         }
         let old_text = original.as_ref().and_then(|o| self.tunnel(o)).map(|t| t.text.clone());
-        if let Some(o) = &original {
-            if o != &name {
-                if let Err(e) = self.store.rename(o, &name) {
+        if let Some(o) = &original
+            && o != &name
+                && let Err(e) = self.store.rename(o, &name) {
                     return self.error(e.to_string());
                 }
-            }
-        }
         if let Err(e) = self.store.save(&name, &text) {
             return self.error(e.to_string());
         }
@@ -645,7 +950,7 @@ impl App {
             self.info(tr.reconnecting.replace("{}", &name));
             self.send(Request::Down { name: name.clone(), config: old_text });
             let cfg = self.runtime_config(&text);
-            self.send(Request::Up { name, config: cfg });
+            self.send(Request::Up { name, config: cfg, boot: self.boot_connect });
         } else {
             self.info(tr.saved);
         }
@@ -655,7 +960,14 @@ impl App {
         let st = Settings {
             lang: Some(if self.ru { "ru" } else { "en" }.into()),
             theme: Some(theme_str(self.theme).into()),
+            version: SETTINGS_VERSION,
             lan_bypass: self.lan_bypass,
+            kill_switch: self.kill_switch,
+            boot_connect: self.boot_connect,
+            check_updates: self.check_updates,
+            update_checked_at: self.update_checked_at,
+            known_update: self.update.clone(),
+            notified_update: self.notified_update.clone(),
         };
         let _ = std::fs::write(
             self.store.dir.parent().unwrap().join("settings.json"),
@@ -688,6 +1000,123 @@ impl App {
     }
 }
 
+/// Files copied in a file manager arrive as text: file:// URIs or absolute paths.
+fn pasted_paths(text: &str) -> Option<Vec<PathBuf>> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines
+        .iter()
+        .map(|l| {
+            let p = match l.strip_prefix("file://") {
+                Some(rest) => PathBuf::from(percent_decode(rest.trim_start_matches("localhost"))),
+                None => PathBuf::from(l),
+            };
+            (p.is_absolute() && p.is_file()).then_some(p)
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+impl App {
+    /// Shortcuts of the Windows client (Ctrl+O, Ctrl+N, Ctrl+E, Delete) plus list
+    /// navigation and Ctrl+V import (the way to bring files in on Wayland, where
+    /// the window toolkit does not support drag and drop).
+    fn keyboard(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        if self.dialog.is_some() || self.tab != Tab::Tunnels {
+            return;
+        }
+        let no_focus = ctx.memory(|m| m.focused().is_none());
+        let shortcut = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        if shortcut(Modifiers::COMMAND, Key::O) {
+            self.pick_import_files();
+        } else if shortcut(Modifiers::COMMAND, Key::N) {
+            self.new_empty_tunnel();
+        } else if shortcut(Modifiers::COMMAND, Key::E) {
+            self.edit_selected();
+        } else if no_focus && shortcut(Modifiers::NONE, Key::Delete) {
+            self.delete_selected();
+        } else if no_focus && (shortcut(Modifiers::NONE, Key::Enter) || shortcut(Modifiers::NONE, Key::Space)) {
+            if let Some(n) = self.selected.clone() {
+                self.toggle(&n);
+            }
+        } else if no_focus && shortcut(Modifiers::NONE, Key::ArrowDown) {
+            self.move_selection(1);
+        } else if no_focus && shortcut(Modifiers::NONE, Key::ArrowUp) {
+            self.move_selection(-1);
+        }
+        if no_focus {
+            let pasted = ctx.input(|i| {
+                i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None })
+            });
+            if let Some(text) = pasted.filter(|t| !t.trim().is_empty()) {
+                match pasted_paths(&text) {
+                    Some(paths) => self.import_paths(paths),
+                    None => self.dialog = Some(Dialog::Paste { text, error: None }),
+                }
+            }
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        if self.tunnels.is_empty() {
+            return;
+        }
+        let cur = self.selected.as_ref().and_then(|s| self.tunnels.iter().position(|t| &t.name == s));
+        let next = match cur {
+            Some(i) => (i as i32 + delta).clamp(0, self.tunnels.len() as i32 - 1) as usize,
+            None => 0,
+        };
+        self.selected = Some(self.tunnels[next].name.clone());
+    }
+
+    fn new_empty_tunnel(&mut self) {
+        let key = crate::keys::generate_private();
+        self.dialog = Some(Dialog::Editor {
+            original: None,
+            name: String::new(),
+            text: format!("[Interface]\nPrivateKey = {key}\n"),
+            error: None,
+        });
+    }
+
+    fn edit_selected(&mut self) {
+        if let Some(t) = self.selected.clone().and_then(|s| self.tunnel(&s).cloned()) {
+            self.dialog = Some(Dialog::Editor { original: Some(t.name.clone()), name: t.name, text: t.text, error: None });
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        let Some(n) = self.selected.clone() else { return };
+        if self.busy.contains_key(&n) {
+            self.error(self.tr().busy_wait);
+        } else if self.active.contains(&n) {
+            self.error(self.tr().active_cant_delete);
+        } else {
+            self.dialog = Some(Dialog::ConfirmDelete(n));
+        }
+    }
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick();
@@ -705,6 +1134,7 @@ impl eframe::App for App {
             self.debug.push_str(",reopened");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        self.keyboard(ctx);
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {
@@ -757,6 +1187,23 @@ impl eframe::App for App {
                         if ui.checkbox(&mut lan, tr.lan_bypass).on_hover_text(tr.lan_bypass_hint).changed() {
                             self.set_lan_bypass(lan);
                         }
+                        let mut ks = self.kill_switch;
+                        if ui.checkbox(&mut ks, tr.kill_switch).on_hover_text(tr.kill_switch_hint).changed() {
+                            self.set_kill_switch(ks);
+                        }
+                        let mut boot = self.boot_connect;
+                        if ui.checkbox(&mut boot, tr.boot_connect).on_hover_text(tr.boot_connect_hint).changed() {
+                            self.set_boot_connect(boot);
+                        }
+                        let mut upd = self.check_updates;
+                        if ui.checkbox(&mut upd, tr.check_updates).on_hover_text(tr.check_updates_hint).changed() {
+                            self.set_check_updates(upd);
+                        }
+                        ui.separator();
+                        if ui.add_enabled(!self.tunnels.is_empty(), egui::Button::new(tr.export_all)).clicked() {
+                            self.pick_export_all();
+                            ui.close();
+                        }
                         ui.separator();
                         ui.label(RichText::new(tr.theme).weak());
                         for (t, label) in [
@@ -779,6 +1226,10 @@ impl eframe::App for App {
                             self.save_settings();
                         }
                         ui.separator();
+                        if ui.button(tr.about).clicked() {
+                            self.dialog = Some(Dialog::About);
+                            ui.close();
+                        }
                         if ui.button(tr.quit).clicked() {
                             self.quit = true;
                             ui.close();
@@ -794,6 +1245,13 @@ impl eframe::App for App {
                     };
                     if ui.button(icon).on_hover_text(hint).clicked() {
                         self.set_theme(&ctx, next);
+                    }
+                    if let Some(u) = self.update.clone() {
+                        let text = RichText::new(tr.update_btn.replace("{}", &u.version)).color(Color32::WHITE);
+                        let btn = egui::Button::new(text).fill(ui.visuals().selection.bg_fill);
+                        if ui.add(btn).on_hover_text(tr.update_hint).clicked() {
+                            crate::desktop::open_url(&u.url);
+                        }
                     }
                 });
             });
@@ -839,34 +1297,23 @@ impl App {
                 let add = ui.add_sized([w, h], egui::Button::new(tr.add_tunnel));
                 egui::Popup::menu(&add).show(|ui| {
                     ui.set_min_width(w);
-                    if ui.button(tr.import_file).clicked() {
+                    if ui.add(egui::Button::new(tr.import_file).shortcut_text("Ctrl+O")).clicked() {
                         self.pick_import_files();
                         ui.close();
                     }
-                    if ui.button(tr.import_text).clicked() {
+                    if ui.add(egui::Button::new(tr.import_text).shortcut_text("Ctrl+V")).clicked() {
                         self.dialog = Some(Dialog::Paste { text: String::new(), error: None });
                         ui.close();
                     }
-                    if ui.button(tr.new_empty).clicked() {
-                        let key = crate::keys::generate_private();
-                        self.dialog = Some(Dialog::Editor {
-                            original: None,
-                            name: String::new(),
-                            text: format!("[Interface]\nPrivateKey = {key}\n"),
-                            error: None,
-                        });
+                    if ui.add(egui::Button::new(tr.new_empty).shortcut_text("Ctrl+N")).clicked() {
+                        self.new_empty_tunnel();
                         ui.close();
                     }
                 });
                 ui.horizontal(|ui| {
                     let sel = self.selected.clone();
                     if ui.add_enabled_ui(sel.is_some(), |ui| ui.add_sized([half, h], egui::Button::new(tr.delete))).inner.clicked() {
-                        let n = sel.clone().unwrap();
-                        if self.active.contains(&n) {
-                            self.error(tr.active_cant_delete);
-                        } else {
-                            self.dialog = Some(Dialog::ConfirmDelete(n));
-                        }
+                        self.delete_selected();
                     }
                     if ui.add_enabled_ui(sel.is_some(), |ui| ui.add_sized([half, h], egui::Button::new(tr.export))).inner.clicked() {
                         self.pick_export_file(sel.unwrap());
@@ -898,21 +1345,54 @@ impl App {
                         FontId::proportional(15.0),
                         text_color,
                     );
-                    if resp.clicked() {
+                    if resp.clicked() || resp.secondary_clicked() {
                         self.selected = Some(name.clone());
                     }
                     if resp.double_clicked() {
-                        if self.active.contains(&name) {
-                            self.deactivate(&name);
-                        } else {
-                            self.activate(&name);
-                        }
+                        self.toggle(&name);
                     }
+                    resp.context_menu(|ui| {
+                        let busy = self.busy.contains_key(&name);
+                        let label = if self.active.contains(&name) { tr.deactivate } else { tr.activate };
+                        if ui.add_enabled(!busy, egui::Button::new(label).shortcut_text("Enter")).clicked() {
+                            self.toggle(&name);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.add(egui::Button::new(tr.edit).shortcut_text("Ctrl+E")).clicked() {
+                            self.edit_selected();
+                            ui.close();
+                        }
+                        if ui.button(tr.export).clicked() {
+                            self.pick_export_file(name.clone());
+                            ui.close();
+                        }
+                        if ui.add(egui::Button::new(tr.delete).shortcut_text("Del")).clicked() {
+                            self.delete_selected();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.add(egui::Button::new(tr.import_file).shortcut_text("Ctrl+O")).clicked() {
+                            self.pick_import_files();
+                            ui.close();
+                        }
+                        if ui.add(egui::Button::new(tr.new_empty).shortcut_text("Ctrl+N")).clicked() {
+                            self.new_empty_tunnel();
+                            ui.close();
+                        }
+                        if ui.button(tr.export_all).clicked() {
+                            self.pick_export_all();
+                            ui.close();
+                        }
+                    });
                 }
             });
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.blocked {
+                self.blocked_banner(ui);
+            }
             let sel = self.selected.clone().and_then(|s| self.tunnel(&s).cloned());
             match sel {
                 Some(t) => {
@@ -925,7 +1405,8 @@ impl App {
                         ui.add_space(ui.available_height() / 3.0);
                         ui.label(RichText::new(tr.no_tunnels).heading());
                         ui.add_space(6.0);
-                        ui.label(RichText::new(tr.drop_hint).weak());
+                        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+                        ui.label(RichText::new(if wayland { tr.drop_hint_wayland } else { tr.drop_hint }).weak());
                         ui.add_space(12.0);
                         if ui.button(tr.import_file).clicked() {
                             self.pick_import_files();
@@ -937,6 +1418,32 @@ impl App {
                 }
             }
         });
+    }
+
+    /// The kill-switch outlived its tunnel: offer to reconnect or to unblock.
+    fn blocked_banner(&mut self, ui: &mut egui::Ui) {
+        let tr = self.tr();
+        egui::Frame::new()
+            .fill(warn(ui).gamma_multiply(0.18))
+            .stroke(egui::Stroke::new(1.0, warn(ui)))
+            .corner_radius(8.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(tr.blocked_banner).strong());
+                ui.horizontal(|ui| {
+                    let last = self.last_active.clone().or_else(|| self.selected.clone());
+                    if let Some(n) = last.filter(|n| self.tunnel(n).is_some())
+                        && ui.button(format!("{} «{n}»", tr.reconnect)).clicked()
+                    {
+                        self.activate(&n);
+                    }
+                    if ui.button(tr.unblock).clicked() {
+                        self.send(Request::Unblock);
+                    }
+                });
+            });
+        ui.add_space(8.0);
     }
 
     fn dot_color(&self, name: &str) -> Color32 {
@@ -1004,10 +1511,40 @@ impl App {
                     ui.label(m);
                     ui.end_row();
                 }
-                if conf.is_full_tunnel() {
+                if let Some(t) = iface.get("Table") {
+                    row_label(ui, tr.table);
+                    ui.label(if t.eq_ignore_ascii_case("off") { tr.off } else { t });
+                    ui.end_row();
+                }
+                let scripts = conf.scripts();
+                if !scripts.is_empty() {
+                    row_label(ui, tr.scripts);
+                    let keys: Vec<&str> = scripts.iter().map(|(k, _)| k.as_str()).collect();
+                    let list: Vec<String> = scripts.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+                    ui.label(RichText::new(keys.join(", ")).color(warn(ui)))
+                        .on_hover_text(format!("{}\n\n{}", tr.scripts_hint, list.join("\n")));
+                    ui.end_row();
+                }
+                if conf.uses_policy_routing() {
                     row_label(ui, tr.local_network);
-                    let txt = if self.lan_bypass { tr.lan_direct } else { tr.lan_via_vpn };
+                    let txt = match (self.lan_bypass, self.kill_switch_on()) {
+                        (true, _) => tr.lan_direct,
+                        (false, true) => tr.lan_blocked,
+                        (false, false) => tr.lan_via_vpn,
+                    };
                     ui.label(txt).on_hover_text(tr.lan_bypass_hint);
+                    ui.end_row();
+                }
+                if self.kill_switch {
+                    row_label(ui, tr.kill_switch_row);
+                    let t = if !nft_available() {
+                        RichText::new(tr.ks_no_nft).color(warn(ui))
+                    } else if conf.uses_policy_routing() {
+                        RichText::new(tr.ks_on)
+                    } else {
+                        RichText::new(tr.ks_na).weak()
+                    };
+                    ui.label(t).on_hover_text(tr.kill_switch_hint);
                     ui.end_row();
                 }
                 row_label(ui, tr.awg_params);
@@ -1117,15 +1654,13 @@ impl App {
         }
 
         ui.add_space(10.0);
-        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            if ui.button(tr.edit).clicked() {
-                self.dialog = Some(Dialog::Editor {
-                    original: Some(t.name.clone()),
-                    name: t.name.clone(),
-                    text: t.text.clone(),
-                    error: None,
-                });
-            }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tr.trusted_note).weak().small());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button(tr.edit).on_hover_text("Ctrl+E").clicked() {
+                    self.edit_selected();
+                }
+            });
         });
     }
 
@@ -1137,8 +1672,12 @@ impl App {
                     ui.ctx().copy_text(self.log.join("\n"));
                     self.toast = Some((tr.copied.into(), false, Instant::now()));
                 }
+                if ui.button(tr.save_log).clicked() {
+                    self.pick_save_log();
+                }
                 if ui.button(tr.clear).clicked() {
                     self.log.clear();
+                    crate::logfile::clear();
                 }
             });
             ui.separator();
@@ -1157,6 +1696,8 @@ impl App {
         let mut save = false;
         let mut do_import: Option<String> = None;
         let mut do_delete: Option<String> = None;
+        let mut do_import_confirmed = false;
+        let mut do_check_update = false;
         match &mut self.dialog {
             None => {}
             Some(Dialog::Editor { original, name, text, error }) => {
@@ -1181,7 +1722,7 @@ impl App {
                         ui.end_row();
                     });
                     ui.add_space(6.0);
-                    let rows = ((screen.height() - 260.0) / 18.0).clamp(8.0, 30.0) as usize;
+                    let rows = ((screen.height() - 280.0) / 18.0).clamp(8.0, 30.0) as usize;
                     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
                         let mut job = highlight(ui, buf.as_str());
                         job.wrap.max_width = wrap;
@@ -1196,13 +1737,19 @@ impl App {
                                 .layouter(&mut layouter),
                         );
                     });
-                    if let Some(e) = error {
+                    // checked while typing, like the Windows editor
+                    let live = config::validate(text).err();
+                    let name_ok = config::is_valid_name(name.trim());
+                    if let Some(e) = error.as_ref().or(live.as_ref()) {
                         ui.add_space(4.0);
                         ui.label(RichText::new(format!("{}: {e}", tr.error)).color(RED));
                     }
                     ui.add_space(8.0);
                     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                        if ui.button(RichText::new(tr.save).strong()).clicked() {
+                        let btn = egui::Button::new(RichText::new(tr.save).strong());
+                        let r = ui.add_enabled(live.is_none() && name_ok, btn);
+                        let r = if name_ok { r } else { r.on_disabled_hover_text(tr.invalid_name) };
+                        if r.clicked() || (r.enabled() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))) {
                             save = true;
                         }
                         if ui.button(tr.cancel).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1242,6 +1789,94 @@ impl App {
                     });
                 });
             }
+            Some(Dialog::ConfirmScripts { scripts, .. }) => {
+                egui::Modal::new(egui::Id::unique("scripts")).show(ctx, |ui| {
+                    ui.set_width((ctx.content_rect().width() - 80.0).clamp(400.0, 760.0));
+                    ui.heading(RichText::new(format!("⚠ {}", tr.scripts_title)).color(warn(ui)));
+                    ui.add_space(4.0);
+                    ui.label(tr.scripts_confirm);
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        for l in scripts.iter() {
+                            ui.add(egui::Label::new(RichText::new(l).monospace()).wrap());
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if ui.button(RichText::new(tr.import_anyway).color(RED)).clicked() {
+                            do_import_confirmed = true;
+                        }
+                        if ui.button(tr.cancel).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            close = true;
+                        }
+                    });
+                });
+            }
+            Some(Dialog::About) => {
+                let logo = self.logo.as_ref().map(|(t, _)| t.clone());
+                let update_checking = self.update_rx.is_some();
+                let update = self.update.clone();
+                egui::Modal::new(egui::Id::unique("about")).show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.vertical_centered(|ui| {
+                        if let Some(l) = logo {
+                            ui.add(egui::Image::new(&l).fit_to_exact_size(Vec2::splat(64.0)));
+                        }
+                        ui.heading("AmneziaWG");
+                        ui.label(format!("awg-gui {}", env!("CARGO_PKG_VERSION")));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(tr.about_text).weak());
+                    });
+                    ui.add_space(8.0);
+                    grid(ui, "about", |ui| {
+                        row_label(ui, tr.version);
+                        ui.label(env!("CARGO_PKG_VERSION"));
+                        ui.end_row();
+                        row_label(ui, tr.backend);
+                        ui.label(match detect_backend() {
+                            Backend::Kernel => tr.backend_kernel,
+                            Backend::SystemGo => tr.backend_system_go,
+                            Backend::Embedded => tr.backend_embedded,
+                            Backend::None => tr.backend_none,
+                        });
+                        ui.end_row();
+                        if let Some(v) = crate::helper::backend_versions() {
+                            row_label(ui, tr.components);
+                            ui.label(RichText::new(v).monospace().small());
+                            ui.end_row();
+                        }
+                        row_label(ui, tr.license);
+                        ui.label("GPL-2.0-or-later");
+                        ui.end_row();
+                        row_label(ui, "GitHub");
+                        if ui.link("coinman-dev/awg-linux-client").on_hover_text(env!("CARGO_PKG_REPOSITORY")).clicked() {
+                            crate::desktop::open_url(env!("CARGO_PKG_REPOSITORY"));
+                        }
+                        ui.end_row();
+                        row_label(ui, tr.updates);
+                        ui.horizontal(|ui| {
+                            let checking = update_checking;
+                            if ui.add_enabled(!checking, egui::Button::new(if checking { tr.checking } else { tr.check_now }))
+                                .on_hover_text(tr.check_updates_hint)
+                                .clicked()
+                            {
+                                do_check_update = true;
+                            }
+                            if let Some(u) = &update
+                                && ui.link(tr.update_available.replace("{}", &u.version)).clicked() {
+                                    crate::desktop::open_url(&u.url);
+                                }
+                        });
+                        ui.end_row();
+                    });
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if ui.button(tr.close).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            close = true;
+                        }
+                    });
+                });
+            }
             Some(Dialog::ConfirmDelete(name)) => {
                 egui::Modal::new(egui::Id::unique("del")).show(ctx, |ui| {
                     ui.set_max_width(420.0);
@@ -1260,6 +1895,12 @@ impl App {
         }
         if close {
             self.dialog = None;
+        }
+        if do_check_update {
+            self.start_update_check(true);
+        }
+        if do_import_confirmed && let Some(Dialog::ConfirmScripts { cands, .. }) = self.dialog.take() {
+            self.import_confirmed(cands);
         }
         if save {
             self.save_editor();
@@ -1472,21 +2113,10 @@ fn ago(tr: &Tr, s: u64) -> String {
     }
 }
 
-/// Local UTC offset in seconds (`date +%z`, evaluated once).
-fn local_offset() -> i64 {
-    use std::sync::OnceLock;
-    static OFF: OnceLock<i64> = OnceLock::new();
-    *OFF.get_or_init(|| {
-        let out = std::process::Command::new("date").arg("+%z").output().ok();
-        let s = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-        if s.len() != 5 {
-            return 0;
-        }
-        let sign = if s.starts_with('-') { -1 } else { 1 };
-        let h: i64 = s[1..3].parse().unwrap_or(0);
-        let m: i64 = s[3..5].parse().unwrap_or(0);
-        sign * (h * 3600 + m * 60)
-    })
+/// `nft` (package nftables) is installed. Checked on use: it may be installed while
+/// the program runs.
+fn nft_available() -> bool {
+    ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/usr/local/sbin/nft"].iter().any(|p| Path::new(p).is_file())
 }
 
 fn detect_backend() -> Backend {
@@ -1509,4 +2139,23 @@ fn detect_backend() -> Backend {
         return Backend::Kernel;
     }
     if crate::helper::has_embedded_backend() { Backend::Embedded } else { Backend::None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_defaults() {
+        let fresh = load_settings(None);
+        assert!(fresh.lan_bypass && fresh.kill_switch && !fresh.boot_connect && !fresh.check_updates);
+        // saved by 0.1.0-beta: no version, lan_bypass written as false
+        let old = load_settings(Some(r#"{"lang":"ru","theme":"dark","lan_bypass":false}"#));
+        assert!(old.lan_bypass && old.kill_switch);
+        assert_eq!(old.lang.as_deref(), Some("ru"));
+        // the user's own choice in the current format is kept
+        let mine = load_settings(Some(r#"{"version":2,"lan_bypass":false,"kill_switch":false}"#));
+        assert!(!mine.lan_bypass && !mine.kill_switch);
+        assert!(load_settings(Some("garbage")).kill_switch);
+    }
 }

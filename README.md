@@ -7,7 +7,7 @@
 <h1 align="center">AmneziaWG client for Linux</h1>
 <p align="center">A graphical AmneziaWG / WireGuard VPN client for Linux in one executable.</p>
 
-[![Release](https://img.shields.io/badge/release-0.1.0--beta-orange)](https://github.com/coinman-dev/awg-linux-client/releases/tag/v0.1.0-beta)
+[![Release](https://img.shields.io/badge/release-0.2.0--beta-orange)](https://github.com/coinman-dev/awg-linux-client/releases/tag/v0.2.0-beta)
 [![Build](https://github.com/coinman-dev/awg-linux-client/actions/workflows/release.yml/badge.svg)](https://github.com/coinman-dev/awg-linux-client/actions/workflows/release.yml)
 [![Linux](https://img.shields.io/badge/Linux-Ubuntu%2024.04%2B%20%2F%20Debian%2013%2B-blue)](#download)
 [![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange)](#building)
@@ -25,7 +25,7 @@ any other AmneziaWG packages.
   <img src="doc/images/en/main-dark.png" alt="awg-gui: tunnel list and details of an active tunnel">
 </p>
 
-> **0.1.0-beta is the first prerelease.** Please report problems on
+> **0.2.0-beta is a prerelease.** Please report problems on
 > [GitHub Issues](https://github.com/coinman-dev/awg-linux-client/issues) and attach the text
 > from the **Log** tab. awg-gui is an independent project and is not affiliated with Amnezia.
 
@@ -33,19 +33,21 @@ any other AmneziaWG packages.
 
 | Edition | Download | Usage |
 |---|---|---|
-| Linux package | [awg-gui_0.1.0-beta_amd64.deb](https://github.com/coinman-dev/awg-linux-client/releases/download/v0.1.0-beta/awg-gui_0.1.0-beta_amd64.deb) | `sudo apt install ./awg-gui_0.1.0-beta_amd64.deb` installs the program with its menu entry, icons and polkit policy. |
+| Linux package | [awg-gui_0.2.0-beta_amd64.deb](https://github.com/coinman-dev/awg-linux-client/releases/download/v0.2.0-beta/awg-gui_0.2.0-beta_amd64.deb) | `sudo apt install ./awg-gui_0.2.0-beta_amd64.deb` installs the program with its menu entry, icons and polkit policy. |
 
 Ubuntu 24.04 or newer, Debian 13 or newer, amd64, Wayland or X11 with OpenGL.
-No advertising or telemetry; the program connects only to your VPN servers.
+No advertising or telemetry. Without your consent the program connects only to your VPN
+servers: the update check is off by default.
 [All releases](https://github.com/coinman-dev/awg-linux-client/releases) ·
 [Changelog](CHANGELOG.md).
 
 ## Quick start
 
-1. Install the package: `sudo apt install ./awg-gui_0.1.0-beta_amd64.deb`.
+1. Install the package: `sudo apt install ./awg-gui_0.2.0-beta_amd64.deb`.
 2. Open **AmneziaWG** from the application menu (**Internet**) or run `awg-gui`.
-3. **Add tunnel** → import a `.conf` file, paste the text of a config or an AmneziaVPN
-   `vpn://` key, or drop files onto the window.
+3. **Add tunnel** → import a `.conf` or `.zip` file, paste the text of a config or an
+   AmneziaVPN `vpn://` key, or copy files in the file manager and press **Ctrl+V** in the window
+   (on X11 you can also drop them onto it).
 4. Click **Activate** and enter the administrator password (asked once per session).
    Closing the window keeps the program in the system tray.
 
@@ -53,20 +55,39 @@ No advertising or telemetry; the program connects only to your VPN servers.
 
 - **Tunnel list** with status indicators; connect and disconnect with a button, a double click
   or from the tray menu. Like the Windows client, one tunnel is active at a time.
-- **Import**: `.conf` files (file dialog or drag and drop), pasted config text, **AmneziaVPN
-  `vpn://` keys**; `awg-gui --import FILE…` from the terminal.
-- **Editor** with syntax highlighting and live public key; **new empty tunnel** with a
-  freshly generated key pair; export and delete.
+- **Import**: `.conf` and `.zip` files (file dialog, Ctrl+V with files copied in the file
+  manager, drag and drop on X11), pasted config text, **AmneziaVPN `vpn://` keys**, UTF-16
+  files from Windows; `awg-gui --import FILE…` from the terminal. Configs with
+  `PreUp`/`PostUp`/`PreDown`/`PostDown` commands (they run as root) are imported only after a
+  warning, and the details view marks them.
+- **Editor** with syntax highlighting, live public key and checking of values while typing;
+  **new empty tunnel** with a freshly generated key pair; export of one tunnel or **all tunnels
+  to a zip**; delete.
+- **Keyboard**: Ctrl+O import, Ctrl+N new tunnel, Ctrl+E edit, Delete, Ctrl+V paste,
+  ↑/↓ and Enter to pick and toggle a tunnel; context menu on the tunnel list.
 - **Live statistics**: latest handshake, received and sent traffic, endpoint, listen port and
   the AmneziaWG obfuscation parameters (Jc, Jmin, Jmax, S1–S4, H1–H4, I1–I5).
 - **AmneziaWG 1.0, 1.5, 2.0, 3.0 and 3.1** configs as well as plain WireGuard; the version is detected
   and the obfuscation parameters are shown one readable row per group.
-- **Bypass VPN for local networks** (☰ menu): with a full-tunnel config, private addresses
-  (192.168.x.x, 10.x.x.x, 172.16–31.x.x, link-local, IPv6 ULA) go directly, so printers, NAS
-  and the router stay reachable; addresses inside the tunnel (its subnet, private DNS) still go
-  through the VPN. Implemented with `ip rule`s added to the runtime copy of the config; the
-  saved config is not changed.
-- Light, dark and system themes; English and Russian interface; operation log.
+- **Kill-switch** (☰ menu → **Block untunneled traffic**), like the Windows client's: for a
+  full-tunnel config an nftables chain drops everything that does not go through the tunnel
+  (except DHCP and IPv6 neighbour discovery), including IPv6 the config does not tunnel. If
+  the tunnel dies, the internet stays blocked; the window offers **Reconnect** and **Remove the
+  block**. On by default; without `nftables` it is not applied and the details view says so.
+- **Bypass VPN for local networks** (☰ menu, on by default): with a full-tunnel config, `awg-quick` already
+  keeps the subnet the computer is attached to outside the tunnel; this option sends all
+  private addresses (other subnets behind the router, 10.x.x.x, 172.16–31.x.x, link-local,
+  multicast, IPv6 ULA) directly too, and lets them through the kill-switch. Addresses inside
+  the tunnel (its subnet, a private DNS) still go through the VPN.
+- Both options are `PostUp`/`PreDown` hooks added to the runtime copy of the config; the saved
+  config is not changed.
+- **Update check** (☰ → **Check for updates**, off by default): once a day the program asks
+  the GitHub API for releases with the system `curl` or `wget`, sending only its version;
+  GitHub sees your IP address. A newer version shows a button and a tray item that open the
+  release page — nothing is downloaded or installed automatically. **About → Check for
+  updates** checks once on demand.
+- Light, dark and system themes; English and Russian interface; operation log with dates,
+  kept across restarts and savable to a file.
 
 <p align="center">
   <img src="doc/images/en/main-light.png" alt="Light theme" width="49%">
@@ -76,11 +97,17 @@ No advertising or telemetry; the program connects only to your VPN servers.
 ## Desktop integration
 
 - **System tray** (StatusNotifierItem): closing the window hides the program to the tray;
-  the tray menu opens the window, toggles tunnels and quits. The icon is coloured while a
+  the tray menu shows the status and addresses, toggles tunnels, opens the window, imports
+  files, shows About and quits. The icon is coloured while a
   tunnel is connected and grey otherwise. KDE Plasma supports it natively; GNOME needs the
   AppIndicator extension (enabled by default in Ubuntu). Without a tray closing the window
   quits the program.
+- **Notifications** when a tunnel is activated or deactivated while the window is closed, on
+  errors, and always when a tunnel goes down by itself.
 - **Autostart** at login, straight into the tray (☰ menu → **Start on login**).
+- **Restore the connection after reboot** (☰ menu): the tunnel that was active at shutdown is
+  brought up at boot, before anyone logs in, by the `awg-gui-boot` systemd service — like the
+  tunnel services of the Windows client. A tunnel you deactivate yourself is not restored.
 - **Single instance**: launching the program again shows the window of the running one.
 - **Tunnels stay up** after the window is closed and after quitting, like the Windows
   services of the original client.
@@ -102,8 +129,9 @@ amneziawg kernel module  OR  amneziawg-go (system or built-in)
 
 The privileged helper is started through polkit once per session; the package installs a
 policy (`org.amnezia.awg-gui.helper`) with a clear message and a few minutes of remembered
-authorization. System-installed `awg`, `awg-quick`, `amneziawg-go` and the kernel module take
-precedence over the built-in copies.
+authorization. The built-in `awg`, `awg-quick` and `amneziawg-go` (pinned releases, see
+**About**) take precedence over system-installed ones, which may be too old for AmneziaWG
+2.0/3.x configs; a loaded `amneziawg` kernel module is still used instead of `amneziawg-go`.
 
 ## Settings and data
 
@@ -111,9 +139,11 @@ precedence over the built-in copies.
 |---|---|
 | Program | `/usr/bin/awg-gui` |
 | Tunnel configs | `~/.config/awg-gui/tunnels/<name>.conf` (mode 0600) |
-| Settings (language, theme, local network bypass) | `~/.config/awg-gui/settings.json` |
+| Settings (language, theme, options of the ☰ menu) | `~/.config/awg-gui/settings.json` |
+| Log | `~/.local/state/awg-gui/awg-gui.log` |
 | Copy of the config of an active tunnel | `/run/awg-gui/<name>.conf` (root, needed for `awg-quick down`) |
 | Built-in `amneziawg-go`, `awg`, `awg-quick` | unpacked to `/var/lib/awg-gui/bin/` when first needed |
+| Tunnel restored at boot | `/var/lib/awg-gui/boot/<name>.conf` (root) and `/etc/systemd/system/awg-gui-boot.service` |
 | Autostart entry | `~/.config/autostart/awg-gui.desktop` |
 
 Tunnel names follow the Linux interface rules: up to 15 characters from `a-z A-Z 0-9 _ = + . -`.
@@ -123,7 +153,7 @@ Tunnel names follow the Linux interface rules: up to 15 characters from `a-z A-Z
 ```bash
 awg-gui                  # start the GUI
 awg-gui --minimized      # start in the system tray
-awg-gui --import FILE…   # import .conf files or files with vpn:// keys
+awg-gui --import FILE…   # import .conf / .zip files or files with vpn:// keys
 awg-gui --install        # add a menu entry for a binary run without the package
 awg-gui --help
 ```

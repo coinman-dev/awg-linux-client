@@ -96,6 +96,28 @@ pub fn set_autostart(on: bool) -> std::io::Result<()> {
     }
 }
 
+/// Open a web page in the default browser (egui's own link opening is not built in).
+pub fn open_url(url: &str) {
+    match std::process::Command::new("xdg-open").arg(url).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => eprintln!("xdg-open: {e}"),
+    }
+}
+
+/// Keep an enabled autostart entry pointing at the current executable
+/// (the binary may have been moved or reinstalled elsewhere).
+pub fn refresh_autostart() {
+    let f = autostart_file();
+    if let (Ok(cur), Ok(exe)) = (fs::read_to_string(&f), exe_quoted()) {
+        let want = desktop_entry(&exe, " --minimized");
+        if cur != want {
+            let _ = fs::write(&f, want);
+        }
+    }
+}
+
 /// Minimal PNG encoder (RGBA8) used for `AWG_GUI_SCREENSHOT`.
 pub fn write_png(path: &Path, img: &eframe::egui::ColorImage) -> std::io::Result<()> {
     let [w, h] = img.size;
@@ -119,18 +141,7 @@ pub fn write_png(path: &Path, img: &eframe::egui::ColorImage) -> std::io::Result
         let mut c = ty.to_vec();
         c.extend_from_slice(data);
         out.extend(&c);
-        out.extend(crc32(&c).to_be_bytes());
+        out.extend(crate::zip::crc32(&c).to_be_bytes());
     }
     fs::write(path, out)
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
-        }
-    }
-    !crc
 }

@@ -6,10 +6,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd")]
 pub enum Request {
-    Up { name: String, config: String },
+    /// `boot`: also restore this tunnel at system boot (otherwise forget any boot tunnel).
+    Up {
+        name: String,
+        config: String,
+        #[serde(default)]
+        boot: bool,
+    },
     /// `config` is used only if the helper no longer has the config the tunnel was started with.
+    /// A tunnel deactivated by the user is no longer restored at boot.
     Down { name: String, config: Option<String> },
     Status,
+    /// Restore this (active) tunnel at boot, or nothing (`None`).
+    SetBoot { tunnel: Option<(String, String)> },
+    /// Remove a kill-switch left behind by a tunnel that went down on its own.
+    Unblock,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -22,6 +33,9 @@ pub struct Response {
     pub output: String,
     #[serde(default)]
     pub status: Option<Vec<IfaceStatus>>,
+    /// (Status) the kill-switch blocks traffic but no tunnel is up.
+    #[serde(default)]
+    pub blocked: bool,
 }
 
 /// First line written by the helper once it is running as root.

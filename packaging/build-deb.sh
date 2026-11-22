@@ -59,14 +59,15 @@ Architecture: $ARCH
 Maintainer: coinman-dev <256808916+coinman-dev@users.noreply.github.com>
 Installed-Size: $SIZE
 Depends: $DEPENDS
-Recommends: libegl1 | libgl1, systemd-resolved | resolvconf, iptables | nftables
+Recommends: libegl1 | libgl1, systemd-resolved | resolvconf, nftables, wget | curl, xdg-utils
 Suggests: amneziawg
 Section: net
 Priority: optional
 Homepage: https://github.com/coinman-dev/awg-linux-client
 Description: AmneziaWG VPN client with a graphical interface
- Manage AmneziaWG / WireGuard tunnels: import .conf files and AmneziaVPN
- vpn:// keys, connect and disconnect, see live statistics.
+ Manage AmneziaWG / WireGuard tunnels: import .conf / .zip files and
+ AmneziaVPN vpn:// keys, connect and disconnect, see live statistics.
+ Optional kill-switch, LAN bypass and restoring the tunnel at boot.
  Lives in the system tray; one self-contained executable with an embedded
  userspace AmneziaWG implementation (amneziawg-go) and awg / awg-quick.
 CTRL
@@ -74,6 +75,17 @@ CTRL
 cat > "$PKG/DEBIAN/postrm" <<'POSTRM'
 #!/bin/sh
 set -e
+case "$1" in
+    remove|purge)
+        # "Restore the connection after reboot" creates this unit at runtime.
+        if [ -f /etc/systemd/system/awg-gui-boot.service ]; then
+            systemctl disable awg-gui-boot.service >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/awg-gui-boot.service
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        rm -rf /var/lib/awg-gui/boot
+        ;;
+esac
 if [ "$1" = "purge" ]; then
     rm -rf /var/lib/awg-gui
 fi

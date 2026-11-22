@@ -9,6 +9,10 @@ pub enum UiEvent {
     Quit,
     Toggle(String),
     Reload,
+    /// Open the window with the import file dialog.
+    Import,
+    /// Open the window with the About dialog.
+    About,
 }
 
 /// Holds the egui context of the currently open window (if any).

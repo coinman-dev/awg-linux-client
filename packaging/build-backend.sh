@@ -10,13 +10,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/awg-gui-build"
 GO_VERSION="${GO_VERSION:-1.24.6}"
-GO_REF="${AWG_GO_REF:-master}"
-TOOLS_REF="${AWG_TOOLS_REF:-master}"
+# Pinned releases (reproducible builds); override to test newer ones.
+GO_REF="${AWG_GO_REF:-v3.1.20261116}"
+TOOLS_REF="${AWG_TOOLS_REF:-v3.1.20260812}"
 mkdir -p "$CACHE" "$ROOT/vendor"
 
 fetch() { # url dir ref
     if [[ -d "$2/.git" ]]; then
-        git -C "$2" fetch -q --depth 1 origin "$3" && git -C "$2" checkout -q FETCH_HEAD
+        git -C "$2" fetch -q --depth 1 origin "$3" && git -C "$2" checkout -q --force FETCH_HEAD
     else
         git clone -q --depth 1 --branch "$3" "$1" "$2"
     fi
@@ -52,4 +53,9 @@ install -m 755 "$CACHE/amneziawg-tools/src/wg" "$ROOT/vendor/awg"
 strip "$ROOT/vendor/awg"
 install -m 755 "$CACHE/amneziawg-tools/src/wg-quick/linux.bash" "$ROOT/vendor/awg-quick"
 
+{
+    echo "amneziawg-go $GO_REF ($(git -C "$CACHE/amneziawg-go" rev-parse --short HEAD))"
+    echo "amneziawg-tools $TOOLS_REF ($(git -C "$CACHE/amneziawg-tools" rev-parse --short HEAD))"
+} > "$ROOT/vendor/versions.txt"
+cat "$ROOT/vendor/versions.txt"
 ls -la "$ROOT/vendor"
