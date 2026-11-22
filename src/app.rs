@@ -116,10 +116,13 @@ pub struct App {
     debug: String,
     lan_bypass: bool,
     awg_expanded: bool,
+    sys_theme: crate::system_theme::SystemTheme,
+    /// System theme last given to the current egui context.
+    applied_sys_theme: Option<egui::Theme>,
 }
 
 impl App {
-    pub fn new(events: Receiver<UiEvent>, waker: Waker, tray: Option<Tray>) -> Self {
+    pub fn new(events: Receiver<UiEvent>, waker: Waker, tray: Option<Tray>, sys_theme: crate::system_theme::SystemTheme) -> Self {
         let store = Store::open().expect("cannot create ~/.config/awg-gui");
         let settings: Settings = std::fs::read_to_string(store.dir.parent().unwrap().join("settings.json"))
             .ok()
@@ -159,6 +162,8 @@ impl App {
             autostart: crate::desktop::autostart_enabled(),
             lan_bypass: settings.lan_bypass,
             awg_expanded: false,
+            sys_theme,
+            applied_sys_theme: None,
             debug: if cfg!(debug_assertions) { std::env::var("AWG_GUI_DEBUG").unwrap_or_default() } else { String::new() },
         };
         app.selected = app.tunnels.first().map(|t| t.name.clone());
@@ -226,10 +231,23 @@ impl App {
             style.visuals.selection.stroke.color = Color32::WHITE;
         });
         ctx.set_theme(self.theme);
+        self.applied_sys_theme = None;
+        self.follow_system_theme(ctx);
         self.logo = None;
         self.show_requested = false;
         self.screenshot = std::env::var_os("AWG_GUI_SCREENSHOT").map(|p| (PathBuf::from(p), 0));
         self.waker.set(Some(ctx.clone()));
+    }
+
+    /// "System" theme: egui falls back to `fallback_theme` because winit reports no
+    /// system theme on Linux; feed it the desktop preference from the portal.
+    fn follow_system_theme(&mut self, ctx: &egui::Context) {
+        let t = self.sys_theme.get();
+        if t.is_some() && t != self.applied_sys_theme {
+            self.applied_sys_theme = t;
+            ctx.options_mut(|o| o.fallback_theme = t.unwrap());
+            ctx.request_repaint();
+        }
     }
 
     /// Called after the window has been closed.
@@ -673,6 +691,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick();
+        self.follow_system_theme(ctx);
         if self.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

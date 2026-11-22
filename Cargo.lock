@@ -254,6 +254,7 @@ dependencies = [
  "serde",
  "serde_json",
  "x25519-dalek",
+ "zbus",
 ]
 
 [[package]]

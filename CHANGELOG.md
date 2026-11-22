@@ -27,6 +27,8 @@ First prerelease.
   trailers, cookies) are shown in a collapsible block, one row each.
 - **Bypass VPN for local networks** option: private addresses go directly while the tunnel's
   own subnet and private DNS servers stay in the VPN (`ip rule`s in the runtime config).
-- Light, dark and system themes; English and Russian interface; operation log.
+- Light, dark and system themes (default: system); the system theme is read from
+  xdg-desktop-portal and followed live, since winit reports none on Linux; English and
+  Russian interface; operation log.
 - Debian package `awg-gui_<version>_amd64.deb` with menu entry, icons and polkit policy;
   release workflow on GitHub Actions.

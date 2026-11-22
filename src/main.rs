@@ -10,6 +10,7 @@ mod keys;
 mod logo;
 mod proto;
 mod store;
+mod system_theme;
 mod tray;
 mod waker;
 
@@ -79,7 +80,8 @@ fn main() {
     }
     desktop::ensure_installed();
     let tray = tray::Tray::spawn(tx, waker.clone());
-    let app = Rc::new(RefCell::new(app::App::new(rx, waker, tray)));
+    let sys_theme = system_theme::spawn(waker.clone());
+    let app = Rc::new(RefCell::new(app::App::new(rx, waker, tray, sys_theme)));
 
     let mut show = !minimized || !app.borrow().has_tray();
     loop {
