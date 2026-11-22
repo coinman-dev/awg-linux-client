@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>awg-gui</vendor>
+  <icon_name>awg-gui</icon_name>
+  <action id="org.amnezia.awg-gui.helper">
+    <description>Manage AmneziaWG VPN tunnels</description>
+    <description xml:lang="ru">Управление VPN-туннелями AmneziaWG</description>
+    <message>Authentication is required to connect or disconnect AmneziaWG VPN tunnels</message>
+    <message xml:lang="ru">Для подключения и отключения VPN-туннелей AmneziaWG требуется аутентификация</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/awg-gui</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--helper</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=AmneziaWG
+GenericName=VPN client
+Comment=AmneziaWG / WireGuard tunnel manager
+Comment[ru]=Управление туннелями AmneziaWG / WireGuard
+Exec=/usr/bin/awg-gui
+Icon=awg-gui
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;wireguard;amnezia;awg;
+StartupWMClass=awg-gui
+StartupNotify=true

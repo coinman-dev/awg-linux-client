@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'doc/**', 'assets/**', 'LICENSE*']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'doc/**', 'assets/**', 'LICENSE*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: awg-gui-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  linux:
+    name: Test and build (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build release binary (without the embedded backend)
+        run: |
+          cargo build --release --locked
+          target/release/awg-gui --version

@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag, for example v0.1.0-beta (must exist unless dry_run is enabled)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build and test without publishing a release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  linux:
+    name: Build Linux .deb (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      DRY_RUN: ${{ inputs.dry_run || false }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.dry_run && github.sha || inputs.tag || github.sha }}
+          fetch-depth: 0
+      - name: Validate version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "Invalid release tag: $RELEASE_TAG"; exit 1; }
+          version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [[ "$RELEASE_TAG" == "v$version" ]] || { echo "Tag $RELEASE_TAG and Cargo.toml version $version differ."; exit 1; }
+          if [[ "$DRY_RUN" != true ]]; then
+            [[ "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" == "$(git rev-parse HEAD)" ]] || { echo 'Checkout is not the requested tag.'; exit 1; }
+          fi
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/notes
+          bash packaging/release-notes.sh "${RELEASE_TAG#v}" > target/notes/release-notes.md
+          cat target/notes/release-notes.md
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential dpkg-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # before the build: the backend binaries are embedded into the executable
+      - name: Build embedded backend (amneziawg-go, awg, awg-quick)
+        run: bash packaging/build-backend.sh
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build and check .deb package
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${RELEASE_TAG#v}"
+          deb="$PWD/target/release-files/awg-gui_${v}_amd64.deb"
+          REQUIRE_BACKEND=1 OUTPUT="$deb" bash packaging/build-deb.sh
+          dpkg-deb -f "$deb" Package Version Architecture Depends
+          contents="$(dpkg-deb -c "$deb")"
+          for f in usr/bin/awg-gui usr/share/applications/awg-gui.desktop \
+                   usr/share/polkit-1/actions/org.amnezia.awg-gui.policy \
+                   usr/share/icons/hicolor/scalable/apps/awg-gui.svg \
+                   usr/share/icons/hicolor/256x256/apps/awg-gui.png; do
+            grep -q "$f" <<< "$contents" || { echo "missing $f"; exit 1; }
+          done
+          [[ "$(target/release/awg-gui --version)" == "awg-gui $v" ]] || { echo 'wrong --version'; exit 1; }
+          # the backend must be embedded (awg-quick is a bash script stored verbatim)
+          grep -aq 'awg-quick(8) rule for' target/release/awg-gui || { echo 'backend not embedded'; exit 1; }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-release
+          path: target/release-files/*.deb
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: target/notes/release-notes.md
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish GitHub Release
+    timeout-minutes: 15
+    if: github.event_name != 'workflow_dispatch' || !inputs.dry_run
+    needs: [linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-release
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: notes
+      - name: Publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -- *.deb > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          prerelease=false
+          [[ "$RELEASE_TAG" == *-* ]] && prerelease=true
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "awg-gui ${RELEASE_TAG#v}" \
+              --notes-file notes/release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --prerelease="$prerelease" \
+            --notes-file notes/release-notes.md
