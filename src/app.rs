@@ -1348,6 +1348,35 @@ fn awg_details(ui: &mut egui::Ui, iface: &config::Section, tr: &Tr) {
                         ui.end_row();
                     }
                 }
+                // AmneziaWG 3.0
+                if get("HeaderProtectionKey").is_some() {
+                    row_label(ui, tr.awg_header_protection);
+                    ui.label(tr.awg_key_set); // a shared secret: not shown
+                    ui.end_row();
+                }
+                if let Some(v) = get("ContentPaddingAddition") {
+                    row_label(ui, tr.awg_content_padding);
+                    ui.label(RichText::new(v.replace('-', " – ")).monospace());
+                    ui.end_row();
+                }
+                let mut first = true;
+                for k in ["RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts"] {
+                    if let Some(v) = get(k) {
+                        row_label(ui, if first { tr.awg_timers } else { "" });
+                        first = false;
+                        ui.label(RichText::new(format!("{k} = {}", v.replace('-', " – "))).monospace());
+                        ui.end_row();
+                    }
+                }
+                // AmneziaWG 3.1
+                for (k, label) in [("RandomTrailers", tr.awg_random_trailers), ("DisableCookies", tr.awg_disable_cookies)] {
+                    if let Some(v) = get(k) {
+                        row_label(ui, label);
+                        let on = matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes");
+                        ui.label(format!("{} ({k} = {v})", if on { tr.on } else { tr.off }));
+                        ui.end_row();
+                    }
+                }
             });
         });
 }

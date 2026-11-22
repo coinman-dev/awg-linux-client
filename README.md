@@ -59,7 +59,7 @@ No advertising or telemetry; the program connects only to your VPN servers.
   freshly generated key pair; export and delete.
 - **Live statistics**: latest handshake, received and sent traffic, endpoint, listen port and
   the AmneziaWG obfuscation parameters (Jc, Jmin, Jmax, S1–S4, H1–H4, I1–I5).
-- **AmneziaWG 1.0, 1.5 and 2.0** configs as well as plain WireGuard; the version is detected
+- **AmneziaWG 1.0, 1.5, 2.0, 3.0 and 3.1** configs as well as plain WireGuard; the version is detected
   and the obfuscation parameters are shown one readable row per group.
 - **Bypass VPN for local networks** (☰ menu): with a full-tunnel config, private addresses
   (192.168.x.x, 10.x.x.x, 172.16–31.x.x, link-local, IPv6 ULA) go directly, so printers, NAS

@@ -41,6 +41,19 @@ pub const AWG_KEYS: &[&str] = &[
     "I5",
 ];
 
+/// AmneziaWG 3.0 interface parameters.
+pub const AWG3_KEYS: &[&str] = &[
+    "HeaderProtectionKey",
+    "ContentPaddingAddition",
+    "RekeyAfterTime",
+    "RekeyTimeout",
+    "RejectAfterTime",
+    "KeepaliveTimeout",
+    "MaxHandshakeAttempts",
+];
+/// AmneziaWG 3.1 interface parameters.
+pub const AWG31_KEYS: &[&str] = &["RandomTrailers", "DisableCookies"];
+
 impl Conf {
     pub fn interface(&self) -> Option<&Section> {
         self.sections.iter().find(|s| s.name.eq_ignore_ascii_case("Interface"))
@@ -54,11 +67,17 @@ impl Conf {
         keys::public_from_private(self.interface()?.get("PrivateKey")?)
     }
 
-    /// "AmneziaWG 2.0" / "1.5" / "1.0" by the parameters present.
+    /// "AmneziaWG 3.1" / "3.0" / "2.0" / "1.5" / "1.0" by the parameters present.
     pub fn awg_version(&self) -> Option<&'static str> {
         let i = self.interface()?;
         if !self.is_awg() {
             return None;
+        }
+        if AWG31_KEYS.iter().any(|k| i.get(k).is_some()) {
+            return Some("AmneziaWG 3.1");
+        }
+        if AWG3_KEYS.iter().any(|k| i.get(k).is_some()) {
+            return Some("AmneziaWG 3.0");
         }
         let ranges = ["H1", "H2", "H3", "H4"].iter().any(|k| i.get(k).map(|v| v.contains('-')).unwrap_or(false));
         let s34 = i.get("S3").is_some() || i.get("S4").is_some();
@@ -79,7 +98,7 @@ impl Conf {
 
     pub fn is_awg(&self) -> bool {
         self.interface()
-            .map(|i| AWG_KEYS.iter().any(|k| i.get(k).is_some()))
+            .map(|i| AWG_KEYS.iter().chain(AWG3_KEYS).chain(AWG31_KEYS).any(|k| i.get(k).is_some()))
             .unwrap_or(false)
     }
 }
@@ -316,6 +335,10 @@ mod tests {
         assert_eq!(parse(&format!("{base}Jc = 4\nH1 = 5\n")).unwrap().awg_version(), Some("AmneziaWG 1.0"));
         assert_eq!(parse(&format!("{base}Jc = 4\nI1 = <r 2>\n")).unwrap().awg_version(), Some("AmneziaWG 1.5"));
         assert_eq!(parse(&format!("{base}Jc = 4\nH1 = 1-9\n")).unwrap().awg_version(), Some("AmneziaWG 2.0"));
+        assert_eq!(parse(&format!("{base}Jc = 4\nRekeyAfterTime = 100-140\n")).unwrap().awg_version(), Some("AmneziaWG 3.0"));
+        assert_eq!(parse(&format!("{base}Jc = 4\nHeaderProtectionKey = x\nRandomTrailers = on\n")).unwrap().awg_version(), Some("AmneziaWG 3.1"));
+        // 3.x parameters alone also mean AmneziaWG
+        assert_eq!(parse(&format!("{base}DisableCookies = on\n")).unwrap().awg_version(), Some("AmneziaWG 3.1"));
     }
 
     #[test]

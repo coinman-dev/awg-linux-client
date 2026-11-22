@@ -95,6 +95,14 @@ pub struct Tr {
     pub awg_padding: &'static str,
     pub awg_headers: &'static str,
     pub awg_imitation: &'static str,
+    pub awg_header_protection: &'static str,
+    pub awg_key_set: &'static str,
+    pub awg_content_padding: &'static str,
+    pub awg_timers: &'static str,
+    pub awg_random_trailers: &'static str,
+    pub awg_disable_cookies: &'static str,
+    pub on: &'static str,
+    pub off: &'static str,
 }
 
 pub const RU: Tr = Tr {
@@ -192,6 +200,14 @@ pub const RU: Tr = Tr {
     awg_padding: "Отступы, байт",
     awg_headers: "Заголовки",
     awg_imitation: "Имитация протоколов",
+    awg_header_protection: "Защита заголовков",
+    awg_key_set: "ключ задан",
+    awg_content_padding: "Добавка к отступам",
+    awg_timers: "Таймеры",
+    awg_random_trailers: "Случайные хвосты пакетов",
+    awg_disable_cookies: "Отключение cookie",
+    on: "включено",
+    off: "выключено",
 };
 
 pub const EN: Tr = Tr {
@@ -289,6 +305,14 @@ pub const EN: Tr = Tr {
     awg_padding: "Padding, bytes",
     awg_headers: "Headers",
     awg_imitation: "Protocol imitation",
+    awg_header_protection: "Header protection",
+    awg_key_set: "key is set",
+    awg_content_padding: "Content padding",
+    awg_timers: "Timers",
+    awg_random_trailers: "Random trailers",
+    awg_disable_cookies: "Disable cookies",
+    on: "on",
+    off: "off",
 };
 
 pub fn detect_ru() -> bool {
